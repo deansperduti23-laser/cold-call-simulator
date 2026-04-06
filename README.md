@@ -2,7 +2,7 @@
 
 A voice-powered AI cold call training tool for medical device sales reps. Practice realistic cold calls against AI-powered executive personas, get real-time exchange grading, and receive detailed AI scorecards after each call.
 
-**Live demo:** [deansperduti23-laser.github.io/cold-call-simulator](https://deansperduti23-laser.github.io/cold-call-simulator/)
+**Live demo:** [emerge-sales-laser.github.io/cold-call-simulator](https://emerge-sales-laser.github.io/cold-call-simulator/)
 
 > This project was built with AI assistance using Claude Code by Anthropic.
 
@@ -35,7 +35,7 @@ A voice-powered AI cold call training tool for medical device sales reps. Practi
 
 ```bash
 # Clone the repository
-git clone https://github.com/deansperduti23-laser/cold-call-simulator.git
+git clone https://github.com/emerge-sales-laser/cold-call-simulator.git
 cd cold-call-simulator
 
 # Install dependencies
