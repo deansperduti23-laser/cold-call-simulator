@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useParams, useLocation } from "wouter";
-import { Loader2, PhoneOff, Send, AlertTriangle, Mic, MicOff, Phone, Volume2 } from "lucide-react";
+import { Loader2, PhoneOff, Send, AlertTriangle, Mic, MicOff, Phone, Volume2, Upload, FileText, X } from "lucide-react";
 import { PERSONAS, PRODUCTS, DEFAULT_PRODUCT_ID } from "@/lib/personas";
 import { buildPersonaSystemPrompt } from "@/lib/prompts";
 import { groqChat, groqWhisper } from "@/lib/groq-client";
 import { createSession, getSession, updateSession, addMessageToSession, type Session } from "@/lib/sessions";
+import { parseFile, getAcceptedFileTypes } from "@/lib/file-parser";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
@@ -34,11 +35,32 @@ const RESULT_COLORS: Record<string, string> = { "NO": "bg-red-600 hover:bg-red-7
 const FEMALE_PERSONAS = new Set(["ceo_luminarx", "vp_sales_clearvision"]);
 
 // ── Intro Popup ──────────────────────────────────────────────────────────────
-function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, personaId: string) => void }) {
+function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, personaId: string, script: string | null) => void }) {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
   const [repName, setRepName] = useState(() => localStorage.getItem("rep_name") || "");
   const [selectedPersona, setSelectedPersona] = useState<string>("");
   const [error, setError] = useState("");
+  const [scriptText, setScriptText] = useState<string | null>(null);
+  const [scriptFileName, setScriptFileName] = useState<string | null>(null);
+  const [scriptLoading, setScriptLoading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setScriptLoading(true);
+    setError("");
+    try {
+      const text = await parseFile(file);
+      if (!text.trim()) throw new Error("File appears to be empty");
+      setScriptText(text);
+      setScriptFileName(file.name);
+    } catch (err: any) {
+      setError(`Failed to parse file: ${err.message}`);
+    }
+    setScriptLoading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
 
   const allPersonas = Object.values(PERSONAS).map(p => ({ id: p.id, title: p.title, displayName: p.displayName, company: p.company, companyDescription: p.companyDescription, department: p.department, avatar: p.avatar, decisionRole: p.decisionRole, topConcerns: p.topConcerns }));
   const ceos = allPersonas.filter(p => p.title === "Chief Executive Officer");
@@ -50,7 +72,9 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
     if (!selectedPersona) { setError("Select a prospect to call"); return; }
     localStorage.setItem("groq_api_key", apiKey.trim());
     localStorage.setItem("rep_name", repName.trim());
-    onStart(apiKey.trim(), repName.trim(), selectedPersona);
+    if (scriptText) localStorage.setItem("call_script", scriptText);
+    else localStorage.removeItem("call_script");
+    onStart(apiKey.trim(), repName.trim(), selectedPersona, scriptText);
   };
 
   return (
@@ -93,6 +117,33 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
                 </button>))}
             </div>
           </div>
+          {/* Script Upload */}
+          <div>
+            <label className="text-sm font-semibold text-gray-700 block mb-1.5">Call Script (optional)</label>
+            <input ref={fileInputRef} type="file" accept={getAcceptedFileTypes()} onChange={handleFileUpload} className="hidden" />
+            {scriptText ? (
+              <div className="border border-green-300 bg-green-50 rounded-lg p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <FileText className="w-4 h-4 text-green-600" />
+                    <span className="text-xs font-semibold text-green-800">{scriptFileName}</span>
+                  </div>
+                  <button onClick={() => { setScriptText(null); setScriptFileName(null); }} className="text-gray-400 hover:text-red-500"><X className="w-4 h-4" /></button>
+                </div>
+                <p className="text-[11px] text-green-700 leading-relaxed line-clamp-3">{scriptText.slice(0, 200)}{scriptText.length > 200 ? "..." : ""}</p>
+              </div>
+            ) : (
+              <button onClick={() => fileInputRef.current?.click()} disabled={scriptLoading}
+                className="w-full border-2 border-dashed border-gray-300 rounded-lg p-4 text-center hover:border-[#1565a7] hover:bg-blue-50 transition-all">
+                {scriptLoading ? (
+                  <><Loader2 className="w-5 h-5 text-gray-400 mx-auto animate-spin mb-1" /><p className="text-xs text-gray-500">Parsing file...</p></>
+                ) : (
+                  <><Upload className="w-5 h-5 text-gray-400 mx-auto mb-1" /><p className="text-xs text-gray-600 font-medium">Upload your call script</p><p className="text-[10px] text-gray-400 mt-0.5">Supports .docx, .pdf, .txt</p></>
+                )}
+              </button>
+            )}
+          </div>
+
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
             <p className="text-xs font-semibold text-amber-800 mb-1">Voice Call Tips</p>
             <ul className="text-xs text-amber-700 space-y-0.5">
@@ -280,6 +331,7 @@ export default function Call() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [input, setInput] = useState("");
+  const [customScript, setCustomScript] = useState<string | null>(() => localStorage.getItem("call_script"));
   const personaIdRef = useRef<string>("");
 
   // Load session
@@ -355,8 +407,9 @@ export default function Call() {
 
   const handleSend = () => { const t = input.trim(); if (!t || isThinking) return; setInput(""); window.speechSynthesis?.cancel(); stt.pause(); sendToAI(t); };
 
-  const handleIntroStart = (key: string, name: string, pId: string) => {
+  const handleIntroStart = (key: string, name: string, pId: string, script: string | null) => {
     setApiKey(key);
+    if (script) setCustomScript(script);
     const s = createSession(pId, DEFAULT_PRODUCT_ID, name);
     setSession(s); setSessionId(s.id); personaIdRef.current = pId;
     setShowIntro(false);
@@ -450,7 +503,27 @@ export default function Call() {
           </div>
           <div className="flex-1 flex flex-col overflow-hidden">
           {activeTab === "Demographics" && <div className="flex-1 overflow-y-auto p-4"><table className="w-full text-xs border-collapse"><tbody>{[["Company",persona.company],["Title",persona.title],["Department",persona.department],["Industry","Medical Device / MedTech"],["Phone",phoneNumber]].map(([l,v]) => <tr key={l} className="border-b border-gray-100"><td className="py-2 px-3 text-gray-500 font-medium w-36 bg-gray-50">{l}</td><td className="py-2 px-3 text-gray-800">{v}</td></tr>)}</tbody></table></div>}
-          {activeTab === "Script" && <div className="flex-1 overflow-y-auto p-4"><div className="bg-gray-50 border border-gray-200 rounded p-3 text-xs text-gray-700 leading-relaxed space-y-3"><p><strong>Opening:</strong> "Hi {persona.displayName.split(" ")[0]}, this is [your name] calling from Emerge. We work exclusively with medical device companies. Do you have 60 seconds?"</p><p><strong>Value:</strong> "We help companies like {persona.company} get a qualified pipeline in 30–60 days."</p><p><strong>Discovery:</strong> "What does your pipeline coverage look like?"</p></div></div>}
+          {activeTab === "Script" && (
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {customScript ? (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2"><FileText className="w-4 h-4 text-[#1565a7]" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Your Uploaded Script</span></div>
+                  </div>
+                  <div className="bg-gray-50 border border-gray-200 rounded p-4 text-xs text-gray-700 leading-relaxed whitespace-pre-wrap max-h-[60vh] overflow-y-auto">{customScript}</div>
+                </div>
+              ) : (
+                <div>
+                  <div className="flex items-center gap-2 mb-2"><FileText className="w-4 h-4 text-gray-400" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Default Script</span></div>
+                  <div className="bg-gray-50 border border-gray-200 rounded p-3 text-xs text-gray-700 leading-relaxed space-y-3">
+                    <p><strong>Opening:</strong> "Hi {persona.displayName.split(" ")[0]}, this is [your name] calling from Emerge. We work exclusively with medical device companies. Do you have 60 seconds?"</p>
+                    <p><strong>Value:</strong> "We help companies like {persona.company} get a qualified pipeline in 30–60 days."</p>
+                    <p><strong>Discovery:</strong> "What does your pipeline coverage look like?"</p>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           {activeTab === "Qualifiers" && <div className="flex-1 overflow-y-auto p-4"><div className="space-y-3">{[{q:"Pipeline coverage?",w:"Urgency"},{q:"How many field reps?",w:"Gaps"},{q:"Reps prospecting or closing?",w:"Fit"},{q:"Tried outsourced sales before?",w:"Objections"}].map((item,i) => <div key={i} className="bg-gray-50 border border-gray-200 rounded p-2.5"><p className="text-xs font-semibold text-gray-800 mb-1">Q{i+1}: "{item.q}"</p><p className="text-[11px] text-blue-700">Why: {item.w}</p></div>)}</div></div>}
           {activeTab === "Sales Info" && <div className="flex-1 overflow-y-auto p-4"><div className="space-y-2">{["21 days to first appointment","60% lower cost than in-house","Med device trained reps","Salesforce integration","Performance guarantee"].map((pt,i) => <div key={i} className="flex items-start gap-2"><span className="text-green-600 font-bold">✓</span><p className="text-xs text-gray-700">{pt}</p></div>)}</div></div>}
 
