@@ -16,11 +16,13 @@ export default function Scorecard() {
 
   const scorecard = session.scorecardJson;
   const transcript = session.transcript;
-  const persona = PERSONAS[session.personaId];
+  const cfg = session.callConfig;
+  const legacyPersona = PERSONAS[session.personaId];
+  const displayName = cfg?.displayName || legacyPersona?.displayName || "Prospect";
+  const titleLabel = cfg?.jobFullTitle || legacyPersona?.title || "";
   const product = PRODUCTS[session.productId];
   const callDuration = session.endedAt ? Math.round((new Date(session.endedAt).getTime() - new Date(session.startedAt).getTime()) / 1000) : 0;
   const formatDur = (s: number) => `${Math.floor(s / 60)}m ${s % 60}s`;
-  const verdictIcon = scorecard.verdict?.includes("Strong") ? "🏆" : scorecard.verdict?.includes("Developing") ? "📈" : "⚠️";
 
   return (
     <div className="min-h-screen bg-white">
@@ -28,7 +30,7 @@ export default function Scorecard() {
         <div className="max-w-4xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-[#1565a7] flex items-center justify-center"><Trophy className="w-5 h-5 text-white" /></div>
-            <div><h1 className="font-semibold text-sm">Call Scorecard</h1><p className="text-xs text-gray-500">{session.repName} calling {persona.displayName}</p></div>
+            <div><h1 className="font-semibold text-sm">Call Scorecard</h1><p className="text-xs text-gray-500">Call with {displayName}</p></div>
           </div>
           <button onClick={() => navigate("/")} className="flex items-center gap-2 text-sm px-3 py-1.5 border border-gray-300 rounded-lg hover:bg-gray-50"><RotateCcw className="w-3.5 h-3.5" /> New Call</button>
         </div>
@@ -41,12 +43,12 @@ export default function Scorecard() {
               <div className="text-center"><p className={`text-2xl font-bold ${scorecard.overallScore >= 75 ? "text-green-500" : scorecard.overallScore >= 55 ? "text-yellow-500" : "text-red-500"}`}>{scorecard.overallScore}</p><p className="text-xs text-gray-500">/ 100</p></div>
             </div>
             <div className="flex-1 text-center md:text-left">
-              <div className="flex items-center justify-center md:justify-start gap-2 mb-2"><span className="text-xl">{verdictIcon}</span><h2 className="text-xl font-bold">{scorecard.verdict}</h2></div>
+              <div className="flex items-center justify-center md:justify-start gap-2 mb-2"><h2 className="text-xl font-bold">{scorecard.verdict}</h2></div>
               <p className="text-sm text-gray-500 leading-relaxed mb-4 max-w-xl">{scorecard.coachingSummary}</p>
               <div className="flex flex-wrap gap-3 justify-center md:justify-start text-xs text-gray-500">
-                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>{persona.avatar}</span><span>{persona.title}</span></div>
-                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>⏱</span><span>{formatDur(callDuration)}</span></div>
-                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>💬</span><span>{Math.floor(transcript.length / 2)} exchanges</span></div>
+                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>{titleLabel}</span></div>
+                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>{formatDur(callDuration)}</span></div>
+                <div className="flex items-center gap-1.5 bg-gray-100 rounded-full px-3 py-1"><span>{Math.floor(transcript.length / 2)} exchanges</span></div>
               </div>
             </div>
           </div>
@@ -84,7 +86,7 @@ export default function Scorecard() {
           </div>
           {showTranscript && <div className="px-6 pb-4 space-y-3">{transcript.map((msg, idx) => (
             <div key={idx} className={`flex gap-2 ${msg.role === "rep" ? "flex-row-reverse" : ""}`}>
-              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${msg.role === "rep" ? "bg-[#1565a7] text-white" : "bg-gray-200"}`}>{msg.role === "rep" ? "R" : persona.avatar}</div>
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold ${msg.role === "rep" ? "bg-[#1565a7] text-white" : "bg-gray-200"}`}>{msg.role === "rep" ? "R" : displayName[0]}</div>
               <div className={`max-w-[80%] rounded-xl px-3 py-2 text-sm ${msg.role === "rep" ? "bg-blue-50" : "bg-gray-100"}`}>{msg.content}</div>
             </div>
           ))}</div>}

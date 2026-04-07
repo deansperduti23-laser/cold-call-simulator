@@ -40,7 +40,7 @@ export const PERSONAS: Record<string, Persona> = {
     company: "NovaPulse Medical",
     companyDescription: "120-person interventional cardiology device company, $38M revenue, Minneapolis",
     department: "Executive Leadership",
-    avatar: "👔",
+    avatar: "",
     personality: "Direct, growth-obsessed, commercially sharp. Will cut through fluff instantly.",
     decisionRole: "Ultimate decision-maker on budget and strategic direction. Will green-light fast if the ROI case is airtight and the risk feels low. Refers operational details to VP of Sales Marcus Webb.",
     topConcerns: [
@@ -85,7 +85,7 @@ BEHAVIORAL RULES:
     company: "LuminarX Surgical",
     companyDescription: "65-person minimally invasive surgical tools startup, Series C, $18M revenue, San Diego",
     department: "Executive Leadership",
-    avatar: "👩‍💼",
+    avatar: "",
     personality: "Visionary, fast-talking, fundraising-mode urgency. Values speed and innovation over process.",
     decisionRole: "Controls all spend. Wearing multiple hats — CEO, de facto head of commercial. No VP of Sales yet. Will make a decision in one call if she believes in it.",
     topConcerns: [
@@ -130,7 +130,7 @@ BEHAVIORAL RULES:
     company: "Vertex MedTech",
     companyDescription: "250-person orthopedic implant company, $85M revenue, private equity-backed, Nashville",
     department: "Executive Leadership",
-    avatar: "🏢",
+    avatar: "",
     personality: "PE-backed exec, metrics-obsessed, cautious with spend, very process-oriented.",
     decisionRole: "Approves all strategic spend. Under PE pressure to hit EBITDA while growing top line. Very process-oriented — needs formal proposals, references, and a clear ROI model before committing.",
     topConcerns: [
@@ -177,7 +177,7 @@ BEHAVIORAL RULES:
     company: "NovaPulse Medical",
     companyDescription: "120-person interventional cardiology device company, $38M revenue, Minneapolis",
     department: "Commercial / Sales",
-    avatar: "📈",
+    avatar: "",
     personality: "Straight-shooter, 18 years med device sales, pipeline-obsessed, protective of his team.",
     decisionRole: "Primary evaluator and operational owner. Controls the sales budget. Drives the recommendation to CEO David Hartley. Most important person to win over — he lives or dies by pipeline.",
     topConcerns: [
@@ -224,7 +224,7 @@ BEHAVIORAL RULES:
     company: "LuminarX Surgical",
     companyDescription: "65-person minimally invasive surgical tools startup, Series C, San Diego",
     department: "Commercial / Sales",
-    avatar: "📊",
+    avatar: "",
     personality: "First VP of Sales at the company, hired 8 months ago, proving himself, eager but stretched thin.",
     decisionRole: "First commercial hire at the VP level. Building the sales playbook from scratch. Has budget authority for sales tools and vendors. Reports to CEO Christine Park who is watching closely.",
     topConcerns: [
@@ -268,7 +268,7 @@ BEHAVIORAL RULES:
     company: "Vertex MedTech",
     companyDescription: "250-person PE-backed orthopedic implant company, $85M revenue, Nashville",
     department: "Commercial / Sales",
-    avatar: "🦴",
+    avatar: "",
     personality: "Veteran ortho sales leader, 22 years in the field, highly skeptical, set in his ways.",
     decisionRole: "Controls the field sales organization of 35 reps. Evaluates all sales tools and vendors. Has seen every outsourced SDR scheme in the industry. Needs to be sold harder than anyone — he's the gatekeeper.",
     topConcerns: [
@@ -312,7 +312,7 @@ BEHAVIORAL RULES:
     company: "ClearVision Diagnostics",
     companyDescription: "90-person ophthalmic diagnostics equipment company, $28M revenue, Boston",
     department: "Commercial / Sales",
-    avatar: "👁️",
+    avatar: "",
     personality: "Sharp, impatient, data-driven, ex-Zeiss and Alcon. Will ask for metrics immediately.",
     decisionRole: "Owns the entire commercial org. Has a small inside sales team but they're underperforming. Looking for expertise and a benchmark for what good looks like. Will make decisions in 2-3 weeks.",
     topConcerns: [
@@ -505,5 +505,5 @@ After scoring, provide:
 - OVERALL SCORE: weighted average (0-100)
 - TOP 2 STRENGTHS: What they did well with specific examples from the transcript
 - TOP 3 IMPROVEMENT AREAS: What to work on with specific coaching points
-- CALL VERDICT: One of: "Strong Call ✅", "Developing ⚠️", or "Needs Work ❌"
+- CALL VERDICT: One of: "Strong Call", "Developing", or "Needs Work"
 `;

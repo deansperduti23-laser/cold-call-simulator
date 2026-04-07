@@ -28,7 +28,9 @@
       "Bash(gh auth:*)",
       "Bash(npx gh-pages:*)",
       "Bash(gh api:*)",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://deansperduti23-laser.github.io/cold-call-simulator/)"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://deansperduti23-laser.github.io/cold-call-simulator/)",
+      "Bash(npx tsc:*)",
+      "Bash(python -c \":*)"
     ]
   }
 }

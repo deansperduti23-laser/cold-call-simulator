@@ -1,16 +1,16 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-import { useParams, useLocation } from "wouter";
-import { Loader2, PhoneOff, Send, AlertTriangle, Mic, MicOff, Phone, Volume2, Upload, FileText, X } from "lucide-react";
-import { PERSONAS, PRODUCTS, DEFAULT_PRODUCT_ID } from "@/lib/personas";
-import { buildPersonaSystemPrompt } from "@/lib/prompts";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useParams } from "wouter";
+import { Loader2, PhoneOff, Send, AlertTriangle, Mic, MicOff, Phone, Volume2, Upload, FileText, X, ChevronDown } from "lucide-react";
+import { PRODUCTS, DEFAULT_PRODUCT_ID } from "@/lib/personas";
+import { JOB_TITLES, SCENARIOS, generateCallConfig, type CallConfig, type Gender } from "@/lib/jobs";
+import { buildCallSystemPrompt } from "@/lib/prompts";
 import { groqChat, groqWhisper } from "@/lib/groq-client";
-import { createSession, getSession, updateSession, addMessageToSession, type Session } from "@/lib/sessions";
-import { parseFile, getAcceptedFileTypes } from "@/lib/file-parser";
+import { createSession, getSession, updateSession, addMessageToSession, type Session, type StoredScript } from "@/lib/sessions";
+import { parseScriptFile, getAcceptedFileTypes } from "@/lib/file-parser";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
 interface ExchangeGrade { exchange: number; repText: string; prospectText: string; grade: "A"|"B"|"C"|"D"|"F"; note: string; }
-interface Persona { id: string; title: string; displayName: string; company: string; companyDescription: string; department: string; avatar: string; decisionRole: string; topConcerns: string[]; }
 
 function gradeExchange(repText: string, prospectText: string): { grade: ExchangeGrade["grade"]; note: string } {
   const rep = repText.toLowerCase(); const prospect = prospectText.toLowerCase();
@@ -32,18 +32,31 @@ function gradeExchange(repText: string, prospectText: string): { grade: Exchange
 const GRADE_COLORS: Record<string, string> = { A: "bg-green-600 text-white", B: "bg-blue-600 text-white", C: "bg-yellow-500 text-black", D: "bg-orange-500 text-white", F: "bg-red-600 text-white" };
 const RESULT_BUTTONS = ["NO", "NC", "NA-HOT", "LM", "CCC", "EMAIL", "WW", "DNC"];
 const RESULT_COLORS: Record<string, string> = { "NO": "bg-red-600 hover:bg-red-700", "NC": "bg-gray-500 hover:bg-gray-600", "NA-HOT": "bg-orange-500 hover:bg-orange-600", "LM": "bg-blue-600 hover:bg-blue-700", "CCC": "bg-purple-600 hover:bg-purple-700", "EMAIL": "bg-teal-600 hover:bg-teal-700", "WW": "bg-yellow-600 hover:bg-yellow-700", "DNC": "bg-gray-800 hover:bg-gray-900" };
-const FEMALE_PERSONAS = new Set(["ceo_luminarx", "vp_sales_clearvision"]);
 
 // ── Intro Popup ──────────────────────────────────────────────────────────────
-function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, personaId: string, script: string | null) => void }) {
+interface IntroResult {
+  apiKey: string;
+  jobTitleId: string;
+  scenarioId: string;
+  customPrompt: string;
+  gender: Gender;
+  script: StoredScript | null;
+}
+
+function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
-  const [repName, setRepName] = useState(() => localStorage.getItem("rep_name") || "");
-  const [selectedPersona, setSelectedPersona] = useState<string>("");
+  const [selectedJob, setSelectedJob] = useState<string>("");
+  const [scenarioId, setScenarioId] = useState<string>("standard");
+  const [customPrompt, setCustomPrompt] = useState<string>(() => localStorage.getItem("custom_prompt") || "");
+  const [gender, setGender] = useState<Gender>("male");
+  const [showConfig, setShowConfig] = useState(false);
   const [error, setError] = useState("");
-  const [scriptText, setScriptText] = useState<string | null>(null);
-  const [scriptFileName, setScriptFileName] = useState<string | null>(null);
+  const [script, setScript] = useState<StoredScript | null>(null);
   const [scriptLoading, setScriptLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const hot = JOB_TITLES.filter(j => j.hot);
+  const others = JOB_TITLES.filter(j => !j.hot);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -51,10 +64,9 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
     setScriptLoading(true);
     setError("");
     try {
-      const text = await parseFile(file);
-      if (!text.trim()) throw new Error("File appears to be empty");
-      setScriptText(text);
-      setScriptFileName(file.name);
+      const parsed = await parseScriptFile(file);
+      if (!parsed.text.trim() && parsed.mimeType !== "application/pdf") throw new Error("File appears to be empty");
+      setScript(parsed);
     } catch (err: any) {
       setError(`Failed to parse file: ${err.message}`);
     }
@@ -62,20 +74,23 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const allPersonas = Object.values(PERSONAS).map(p => ({ id: p.id, title: p.title, displayName: p.displayName, company: p.company, companyDescription: p.companyDescription, department: p.department, avatar: p.avatar, decisionRole: p.decisionRole, topConcerns: p.topConcerns }));
-  const ceos = allPersonas.filter(p => p.title === "Chief Executive Officer");
-  const vps = allPersonas.filter(p => p.title === "VP of Sales");
-
   const handleStart = () => {
     if (!apiKey.trim()) { setError("Groq API key is required. Get one free at console.groq.com/keys"); return; }
-    if (!repName.trim()) { setError("Your name is required"); return; }
-    if (!selectedPersona) { setError("Select a prospect to call"); return; }
+    if (!selectedJob) { setError("Select a position to call"); return; }
+    if (scenarioId === "custom" && !customPrompt.trim()) { setError("Custom prompt cannot be empty"); return; }
     localStorage.setItem("groq_api_key", apiKey.trim());
-    localStorage.setItem("rep_name", repName.trim());
-    if (scriptText) localStorage.setItem("call_script", scriptText);
-    else localStorage.removeItem("call_script");
-    onStart(apiKey.trim(), repName.trim(), selectedPersona, scriptText);
+    if (scenarioId === "custom") localStorage.setItem("custom_prompt", customPrompt);
+    onStart({ apiKey: apiKey.trim(), jobTitleId: selectedJob, scenarioId, customPrompt, gender, script });
   };
+
+  const renderJobButton = (j: typeof JOB_TITLES[number]) => (
+    <button key={j.id} onClick={() => setSelectedJob(j.id)}
+      className={`text-left p-2.5 rounded-lg border-2 transition-all text-xs ${selectedJob === j.id ? "border-[#1565a7] bg-blue-50 ring-2 ring-blue-200" : "border-gray-200 hover:border-gray-300"}`}>
+      <div className="font-semibold text-gray-900 text-sm">{j.label}</div>
+      <div className="text-[10px] text-gray-500 mt-0.5">{j.fullTitle}</div>
+      <div className="text-[10px] text-gray-400 mt-1 leading-tight">{j.description}</div>
+    </button>
+  );
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
@@ -93,44 +108,80 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
               className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1565a7]" />
             <p className="text-xs text-gray-400 mt-1">Free — no credit card needed. Get yours at <a href="https://console.groq.com/keys" target="_blank" rel="noopener" className="text-blue-600 underline">console.groq.com/keys</a></p>
           </div>
-          <div>
-            <label className="text-sm font-semibold text-gray-700 block mb-1.5">Your Name</label>
-            <input type="text" value={repName} onChange={(e) => setRepName(e.target.value)} placeholder="e.g. Sarah Mitchell"
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#1565a7]" />
-          </div>
+
           <div>
             <label className="text-sm font-semibold text-gray-700 block mb-2">Who are you calling?</label>
-            <p className="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Chief Executive Officers</p>
-            <div className="grid grid-cols-3 gap-2 mb-3">
-              {ceos.map(p => (
-                <button key={p.id} onClick={() => setSelectedPersona(p.id)} className={`text-left p-2.5 rounded-lg border-2 transition-all text-xs ${selectedPersona === p.id ? "border-[#1565a7] bg-blue-50 ring-2 ring-blue-200" : "border-gray-200 hover:border-gray-300"}`}>
-                  <div className="flex items-center gap-2 mb-1"><span className="text-lg">{p.avatar}</span><div><div className="font-semibold text-gray-900">{p.displayName}</div><div className="text-gray-500 text-[10px]">{p.title}</div></div></div>
-                  <div className="text-[10px] text-blue-600 font-medium">{p.company}</div><div className="text-[10px] text-gray-400 mt-0.5 leading-tight">{p.companyDescription}</div>
-                </button>))}
+
+            <div className="mb-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-orange-500 mb-1.5">Hot Right Now</p>
+              <div className="grid grid-cols-2 gap-2">
+                {hot.map(renderJobButton)}
+              </div>
             </div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">VP of Sales</p>
-            <div className="grid grid-cols-3 gap-2">
-              {vps.map(p => (
-                <button key={p.id} onClick={() => setSelectedPersona(p.id)} className={`text-left p-2.5 rounded-lg border-2 transition-all text-xs ${selectedPersona === p.id ? "border-[#1565a7] bg-blue-50 ring-2 ring-blue-200" : "border-gray-200 hover:border-gray-300"}`}>
-                  <div className="flex items-center gap-2 mb-1"><span className="text-lg">{p.avatar}</span><div><div className="font-semibold text-gray-900">{p.displayName}</div><div className="text-gray-500 text-[10px]">{p.title}</div></div></div>
-                  <div className="text-[10px] text-blue-600 font-medium">{p.company}</div><div className="text-[10px] text-gray-400 mt-0.5 leading-tight">{p.companyDescription}</div>
-                </button>))}
+
+            <p className="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">More Positions</p>
+            <div className="grid grid-cols-2 gap-2">
+              {others.map(renderJobButton)}
             </div>
           </div>
+
+          {/* Configuration dropdown */}
+          <div className="border border-gray-200 rounded-lg">
+            <button type="button" onClick={() => setShowConfig(s => !s)}
+              className="w-full flex items-center justify-between px-3 py-2 text-sm font-semibold text-gray-700">
+              <span>Configuration</span>
+              <ChevronDown className={`w-4 h-4 transition-transform ${showConfig ? "rotate-180" : ""}`} />
+            </button>
+            {showConfig && (
+              <div className="px-3 pb-3 space-y-3 border-t border-gray-200 pt-3">
+                <div>
+                  <label className="text-xs font-semibold text-gray-600 block mb-1">Scenario Preset</label>
+                  <select value={scenarioId} onChange={e => setScenarioId(e.target.value)}
+                    className="w-full px-2 py-1.5 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-[#1565a7]">
+                    {SCENARIOS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                  </select>
+                  <p className="text-[10px] text-gray-400 mt-1">{SCENARIOS.find(s => s.id === scenarioId)?.description}</p>
+                </div>
+
+                {scenarioId === "custom" && (
+                  <div>
+                    <label className="text-xs font-semibold text-gray-600 block mb-1">Custom Prompt</label>
+                    <textarea value={customPrompt} onChange={e => setCustomPrompt(e.target.value)}
+                      placeholder="Describe how the prospect should behave..."
+                      rows={4}
+                      className="w-full px-2 py-1.5 text-xs border border-gray-300 rounded font-mono focus:outline-none focus:ring-1 focus:ring-[#1565a7]" />
+                  </div>
+                )}
+
+                <div>
+                  <label className="text-xs font-semibold text-gray-600 block mb-1">Gender</label>
+                  <div className="flex gap-2">
+                    {(["male","female"] as Gender[]).map(g => (
+                      <button key={g} onClick={() => setGender(g)}
+                        className={`flex-1 px-3 py-1.5 text-xs rounded border-2 capitalize ${gender === g ? "border-[#1565a7] bg-blue-50 text-[#1565a7] font-semibold" : "border-gray-200 text-gray-600"}`}>
+                        {g}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Script Upload */}
           <div>
             <label className="text-sm font-semibold text-gray-700 block mb-1.5">Call Script (optional)</label>
             <input ref={fileInputRef} type="file" accept={getAcceptedFileTypes()} onChange={handleFileUpload} className="hidden" />
-            {scriptText ? (
+            {script ? (
               <div className="border border-green-300 bg-green-50 rounded-lg p-3">
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <FileText className="w-4 h-4 text-green-600" />
-                    <span className="text-xs font-semibold text-green-800">{scriptFileName}</span>
+                    <span className="text-xs font-semibold text-green-800">{script.fileName}</span>
                   </div>
-                  <button onClick={() => { setScriptText(null); setScriptFileName(null); }} className="text-gray-400 hover:text-red-500"><X className="w-4 h-4" /></button>
+                  <button onClick={() => setScript(null)} className="text-gray-400 hover:text-red-500"><X className="w-4 h-4" /></button>
                 </div>
-                <p className="text-[11px] text-green-700 leading-relaxed line-clamp-3">{scriptText.slice(0, 200)}{scriptText.length > 200 ? "..." : ""}</p>
+                <p className="text-[11px] text-green-700 mt-1">File embedded — will render in the Script tab during the call.</p>
               </div>
             ) : (
               <button onClick={() => fileInputRef.current?.click()} disabled={scriptLoading}
@@ -138,7 +189,7 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
                 {scriptLoading ? (
                   <><Loader2 className="w-5 h-5 text-gray-400 mx-auto animate-spin mb-1" /><p className="text-xs text-gray-500">Parsing file...</p></>
                 ) : (
-                  <><Upload className="w-5 h-5 text-gray-400 mx-auto mb-1" /><p className="text-xs text-gray-600 font-medium">Upload your call script</p><p className="text-[10px] text-gray-400 mt-0.5">Supports .docx, .pdf, .txt</p></>
+                  <><Upload className="w-5 h-5 text-gray-400 mx-auto mb-1" /><p className="text-xs text-gray-600 font-medium">Upload your call script</p><p className="text-[10px] text-gray-400 mt-0.5">Embeds .docx, .pdf, .txt directly</p></>
                 )}
               </button>
             )}
@@ -162,12 +213,12 @@ function IntroPopup({ onStart }: { onStart: (apiKey: string, repName: string, pe
 }
 
 // ── Web Speech TTS (gender-aware) ────────────────────────────────────────────
-function speakText(text: string, personaId?: string, onStart?: () => void, onEnd?: () => void) {
+function speakText(text: string, gender: Gender, onStart?: () => void, onEnd?: () => void) {
   if (!window.speechSynthesis) { onEnd?.(); return; }
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.rate = 1.05;
-  const isFemale = personaId ? FEMALE_PERSONAS.has(personaId) : false;
+  const isFemale = gender === "female";
   const voices = window.speechSynthesis.getVoices();
   let voice: SpeechSynthesisVoice | undefined;
   if (isFemale) {
@@ -309,10 +360,26 @@ function useAlwaysOnSTT(onFinalResult: (text: string) => void, enabled: boolean,
   return { isListening: isListening && !isTranscribing, interimText, supported, error, pause, resume, isTranscribing };
 }
 
+// ── Embedded Script Viewer ───────────────────────────────────────────────────
+function ScriptViewer({ script }: { script: StoredScript }) {
+  if (script.mimeType === "application/pdf") {
+    return (
+      <div className="w-full h-[60vh] border border-gray-200 rounded">
+        <object data={script.dataUrl} type="application/pdf" className="w-full h-full">
+          <iframe src={script.dataUrl} title={script.fileName} className="w-full h-full" />
+        </object>
+      </div>
+    );
+  }
+  return (
+    <div className="bg-white border border-gray-200 rounded p-4 text-xs text-gray-700 leading-relaxed max-h-[60vh] overflow-y-auto prose prose-sm max-w-none"
+      dangerouslySetInnerHTML={{ __html: script.html }} />
+  );
+}
+
 // ── Main Call Component ──────────────────────────────────────────────────────
 export default function Call() {
   const { id } = useParams<{ id: string }>();
-  const [, navigate] = useLocation();
   const [showIntro, setShowIntro] = useState(!id);
   const [sessionId, setSessionId] = useState<number | null>(id ? Number(id) : null);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
@@ -331,8 +398,7 @@ export default function Call() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [input, setInput] = useState("");
-  const [customScript, setCustomScript] = useState<string | null>(() => localStorage.getItem("call_script"));
-  const personaIdRef = useRef<string>("");
+  const callConfigRef = useRef<CallConfig | null>(null);
 
   // Load session
   useEffect(() => {
@@ -340,7 +406,7 @@ export default function Call() {
       const s = getSession(sessionId);
       if (s) {
         setSession(s);
-        personaIdRef.current = s.personaId;
+        callConfigRef.current = s.callConfig || null;
         if (s.transcript.length > 0 && transcript.length === 0) {
           setTranscript(s.transcript as Message[]);
           const rebuilt: ExchangeGrade[] = [];
@@ -370,16 +436,15 @@ export default function Call() {
   const formatTime = (s: number) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
   const contactDate = new Date().toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "numeric" });
 
-  // Send to Groq directly from browser
   const sendToAI = useCallback(async (repText: string) => {
-    if (!sessionId || !apiKey || isThinking) return;
+    if (!sessionId || !apiKey || isThinking || !callConfigRef.current) return;
     setIsThinking(true); setVoiceError(null); stt.pause();
     const newTranscript: Message[] = [...transcript, { role: "rep", content: repText }];
     setTranscript(newTranscript);
     addMessageToSession(sessionId, "rep", repText);
 
     try {
-      const systemPrompt = buildPersonaSystemPrompt(personaIdRef.current, DEFAULT_PRODUCT_ID);
+      const systemPrompt = buildCallSystemPrompt(callConfigRef.current, DEFAULT_PRODUCT_ID, session?.script?.text);
       const reply = await groqChat(apiKey, systemPrompt, newTranscript.slice(0, -1), repText);
       const fullTranscript: Message[] = [...newTranscript, { role: "prospect", content: reply }];
       setTranscript(fullTranscript);
@@ -395,35 +460,41 @@ export default function Call() {
       }
 
       if (reply) {
-        speakText(reply, personaIdRef.current, () => setIsSpeaking(true), () => { setIsSpeaking(false); stt.resume(); });
+        speakText(reply, callConfigRef.current.gender, () => setIsSpeaking(true), () => { setIsSpeaking(false); stt.resume(); });
       } else { stt.resume(); }
     } catch (err: any) {
       setIsThinking(false); stt.resume();
       setVoiceError(err.message || String(err));
     }
-  }, [sessionId, apiKey, transcript]);
+  }, [sessionId, apiKey, transcript, session]);
 
   const stt = useAlwaysOnSTT((text) => sendToAI(text), micEnabled, apiKey);
 
   const handleSend = () => { const t = input.trim(); if (!t || isThinking) return; setInput(""); window.speechSynthesis?.cancel(); stt.pause(); sendToAI(t); };
 
-  const handleIntroStart = (key: string, name: string, pId: string, script: string | null) => {
-    setApiKey(key);
-    if (script) setCustomScript(script);
-    const s = createSession(pId, DEFAULT_PRODUCT_ID, name);
-    setSession(s); setSessionId(s.id); personaIdRef.current = pId;
+  const handleIntroStart = (r: IntroResult) => {
+    setApiKey(r.apiKey);
+    const config = generateCallConfig({
+      jobTitleId: r.jobTitleId,
+      scenarioId: r.scenarioId,
+      customPrompt: r.customPrompt,
+      gender: r.gender,
+    });
+    callConfigRef.current = config;
+    const s = createSession({ productId: DEFAULT_PRODUCT_ID, callConfig: config, script: r.script ?? undefined });
+    setSession(s); setSessionId(s.id);
     setShowIntro(false);
     window.location.hash = `/call/${s.id}`;
   };
 
   const handleEndCall = async () => {
-    if (isEnding) return;
+    if (isEnding || !callConfigRef.current) return;
     setIsEnding(true); setEndCallError(null);
     window.speechSynthesis?.cancel(); setMicEnabled(false);
     try {
       const { buildScoringPrompt } = await import("@/lib/prompts");
       const { groqScorecard } = await import("@/lib/groq-client");
-      const scoringPrompt = buildScoringPrompt(personaIdRef.current, DEFAULT_PRODUCT_ID, transcript);
+      const scoringPrompt = buildScoringPrompt(callConfigRef.current, DEFAULT_PRODUCT_ID, transcript);
       const scoringText = await groqScorecard(apiKey, scoringPrompt);
       let scorecard: any = {};
       try {
@@ -442,29 +513,30 @@ export default function Call() {
     }
   };
 
+  const phoneNumber = useMemo(() => {
+    const seed = (callConfigRef.current?.displayName || "x").split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+    return `(${600 + (seed % 400)}) 555-${String(1000 + (seed % 9000)).slice(0, 4)}`;
+  }, [session]);
+
   if (showIntro) {
-    return (<div className="min-h-screen bg-[#e8ecf0]">
-      <div className="bg-[#1565a7] text-white flex items-center justify-between px-3 py-1.5"><div className="flex items-center gap-4"><span className="font-bold text-sm tracking-wide">Emerge CRM</span><div className="flex items-center gap-3 text-xs text-blue-100"><span>Menu</span><span>Calendar</span><span>Documents</span><span>My CRM</span></div></div><div className="text-sm font-semibold">Emerge, Inc.</div></div>
-      <div className="bg-[#2980c9] px-3 py-1"><span className="text-white font-semibold text-xs">Emerge Sales Leads</span></div>
-      <div className="h-[calc(100vh-60px)] bg-[#e8ecf0]" /><IntroPopup onStart={handleIntroStart} /></div>);
+    return (
+      <div className="min-h-screen bg-[#e8ecf0]">
+        <div className="bg-[#2980c9] px-3 py-1"><span className="text-white font-semibold text-xs">Emerge Sales Leads</span></div>
+        <div className="h-[calc(100vh-30px)] bg-[#e8ecf0]" />
+        <IntroPopup onStart={handleIntroStart} />
+      </div>
+    );
   }
 
-  if (!session) return <div className="min-h-screen flex items-center justify-center bg-[#e8ecf0]"><Loader2 className="w-6 h-6 animate-spin text-gray-500" /></div>;
+  if (!session || !callConfigRef.current) return <div className="min-h-screen flex items-center justify-center bg-[#e8ecf0]"><Loader2 className="w-6 h-6 animate-spin text-gray-500" /></div>;
 
-  const persona = PERSONAS[session.personaId];
-  const phoneDigits = persona.id.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
-  const phoneNumber = `(${600 + (phoneDigits % 400)}) 555-${String(1000 + (phoneDigits % 9000)).slice(0, 4)}`;
+  const config = callConfigRef.current;
   const avgGrade = grades.length > 0 ? (["A","B","C","D","F"].find(g => { const sc: Record<string,number> = {A:4,B:3,C:2,D:1,F:0}; const avg = grades.reduce((s,gr) => s+sc[gr.grade],0)/grades.length; return (g==="A"&&avg>=3.5)||(g==="B"&&avg>=2.5&&avg<3.5)||(g==="C"&&avg>=1.5&&avg<2.5)||(g==="D"&&avg>=0.5&&avg<1.5)||(g==="F"&&avg<0.5); }) || "C") : null;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#e8ecf0] font-sans text-xs">
-      <div className="bg-[#1565a7] text-white flex items-center justify-between px-3 py-1.5 flex-shrink-0">
-        <div className="flex items-center gap-4"><span className="font-bold text-sm tracking-wide">Emerge CRM</span><div className="flex items-center gap-3 text-xs text-blue-100"><span>Menu</span><span>Calendar</span><span>Documents</span><span>My CRM</span></div></div>
-        <div className="text-sm font-semibold">Emerge, Inc.</div>
-        <div className="flex items-center gap-3 text-xs text-blue-100"><span>Admin</span><span>Support</span><span className="text-white font-medium">{session.repName.toLowerCase().replace(" ", ".")}@emerge.com</span></div>
-      </div>
       <div className="bg-[#2980c9] px-3 py-1 flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-3"><span className="text-white font-semibold text-xs">Emerge Sales Leads</span><span className="text-blue-200 text-xs">{session.repName}</span></div>
+        <div className="flex items-center gap-3"><span className="text-white font-semibold text-xs">Emerge Sales Leads</span></div>
         <div className="flex items-center gap-2"><select className="text-xs px-2 py-0.5 rounded border-0 bg-white text-gray-700"><option>Search All</option></select><input className="text-xs px-2 py-0.5 rounded border-0 w-40" placeholder="Search..." /><button className="bg-[#1565a7] text-white text-xs px-2 py-0.5 rounded">Go</button></div>
       </div>
 
@@ -476,18 +548,18 @@ export default function Call() {
         <div className="w-56 bg-white border-r border-gray-300 flex flex-col flex-shrink-0 overflow-y-auto">
           <div className="border-b border-gray-200 px-3 py-1.5 flex items-center gap-3 bg-gray-50"><button className="text-blue-700 font-medium hover:underline">Edit</button><button className="text-blue-700 font-medium hover:underline">Add</button></div>
           <div className="px-3 py-3 border-b border-gray-200">
-            <div className="font-bold text-sm text-gray-900">{persona.displayName}</div><div className="text-gray-600 mt-0.5">{persona.title}</div>
-            <div className="mt-2"><div className="font-semibold text-gray-800">{persona.company}</div><div className="text-gray-600 mt-0.5">{persona.companyDescription.split(",")[0]}</div></div>
+            <div className="font-bold text-sm text-gray-900">{config.displayName}</div><div className="text-gray-600 mt-0.5">{config.jobFullTitle}</div>
+            <div className="mt-2"><div className="font-semibold text-gray-800">{config.company}</div><div className="text-gray-600 mt-0.5">Medical Device</div></div>
             <div className="mt-3 space-y-1.5">
-              <div className="flex items-center gap-2"><div className="w-5 h-5 rounded-full bg-[#1565a7] flex items-center justify-center"><span className="text-white text-[9px]">✉</span></div><span className="text-blue-700 text-xs">{persona.displayName.toLowerCase().replace(" ", ".")}@{persona.company.toLowerCase().replace(/\s+/g, "")}.com</span></div>
-              <div className="flex items-center gap-2"><div className="w-5 h-5 rounded-full bg-[#1565a7] flex items-center justify-center"><span className="text-white text-[9px]">☎</span></div><span className="text-gray-700">{phoneNumber}</span></div>
+              <div className="flex items-center gap-2"><div className="w-5 h-5 rounded-full bg-[#1565a7] flex items-center justify-center"><span className="text-white text-[9px] font-bold">E</span></div><span className="text-blue-700 text-xs">{config.displayName.toLowerCase().replace(" ", ".")}@{config.company.toLowerCase().replace(/\s+/g, "")}.com</span></div>
+              <div className="flex items-center gap-2"><div className="w-5 h-5 rounded-full bg-[#1565a7] flex items-center justify-center"><span className="text-white text-[9px] font-bold">P</span></div><span className="text-gray-700">{phoneNumber}</span></div>
             </div>
           </div>
           <div className="px-3 py-2 border-b border-gray-200"><div className="text-gray-500 mb-1">Lead Status</div><div className="bg-yellow-400 text-black font-semibold px-2 py-0.5 rounded text-xs inline-block">New</div></div>
           <div className="px-3 py-2 border-b border-gray-200 space-y-1 text-[11px]">
             <div className="flex justify-between"><span className="text-gray-500">Contact Time</span><span className="font-mono text-green-700 font-semibold">{formatTime(callDuration)}</span></div>
             <div className="flex justify-between"><span className="text-gray-500">Date</span><span className="text-gray-700">{contactDate}</span></div>
-            <div className="flex justify-between"><span className="text-gray-500">Contact Owner</span><span className="text-gray-700">{session.repName}</span></div>
+            <div className="flex justify-between"><span className="text-gray-500">Scenario</span><span className="text-gray-700 truncate">{config.scenarioLabel}</span></div>
             <div className="flex justify-between"><span className="text-gray-500">Exchanges</span><span className="text-gray-700">{grades.length}</span></div>
             {avgGrade && <div className="flex justify-between items-center mt-1"><span className="text-gray-500">Avg Grade</span><span className={`font-bold text-sm px-1.5 rounded ${GRADE_COLORS[avgGrade]}`}>{avgGrade}</span></div>}
           </div>
@@ -502,22 +574,22 @@ export default function Call() {
             ))}
           </div>
           <div className="flex-1 flex flex-col overflow-hidden">
-          {activeTab === "Demographics" && <div className="flex-1 overflow-y-auto p-4"><table className="w-full text-xs border-collapse"><tbody>{[["Company",persona.company],["Title",persona.title],["Department",persona.department],["Industry","Medical Device / MedTech"],["Phone",phoneNumber]].map(([l,v]) => <tr key={l} className="border-b border-gray-100"><td className="py-2 px-3 text-gray-500 font-medium w-36 bg-gray-50">{l}</td><td className="py-2 px-3 text-gray-800">{v}</td></tr>)}</tbody></table></div>}
+          {activeTab === "Demographics" && <div className="flex-1 overflow-y-auto p-4"><table className="w-full text-xs border-collapse"><tbody>{[["Company",config.company],["Title",config.jobFullTitle],["Industry","Medical Device / MedTech"],["Phone",phoneNumber],["Scenario",config.scenarioLabel]].map(([l,v]) => <tr key={l} className="border-b border-gray-100"><td className="py-2 px-3 text-gray-500 font-medium w-36 bg-gray-50">{l}</td><td className="py-2 px-3 text-gray-800">{v}</td></tr>)}</tbody></table></div>}
           {activeTab === "Script" && (
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {customScript ? (
+              {session.script ? (
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2"><FileText className="w-4 h-4 text-[#1565a7]" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Your Uploaded Script</span></div>
+                    <div className="flex items-center gap-2"><FileText className="w-4 h-4 text-[#1565a7]" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">{session.script.fileName}</span></div>
                   </div>
-                  <div className="bg-gray-50 border border-gray-200 rounded p-4 text-xs text-gray-700 leading-relaxed whitespace-pre-wrap max-h-[60vh] overflow-y-auto">{customScript}</div>
+                  <ScriptViewer script={session.script} />
                 </div>
               ) : (
                 <div>
                   <div className="flex items-center gap-2 mb-2"><FileText className="w-4 h-4 text-gray-400" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Default Script</span></div>
                   <div className="bg-gray-50 border border-gray-200 rounded p-3 text-xs text-gray-700 leading-relaxed space-y-3">
-                    <p><strong>Opening:</strong> "Hi {persona.displayName.split(" ")[0]}, this is [your name] calling from Emerge. We work exclusively with medical device companies. Do you have 60 seconds?"</p>
-                    <p><strong>Value:</strong> "We help companies like {persona.company} get a qualified pipeline in 30–60 days."</p>
+                    <p><strong>Opening:</strong> "Hi {config.displayName.split(" ")[0]}, this is [your name] calling from Emerge. We work exclusively with medical device companies. Do you have 60 seconds?"</p>
+                    <p><strong>Value:</strong> "We help companies like {config.company} get a qualified pipeline in 30-60 days."</p>
                     <p><strong>Discovery:</strong> "What does your pipeline coverage look like?"</p>
                   </div>
                 </div>
@@ -530,26 +602,26 @@ export default function Call() {
             <div className="flex items-center justify-center gap-3 py-2 bg-blue-50 border border-blue-200 rounded-lg">
               {stt.isTranscribing ? <><Loader2 className="w-4 h-4 text-purple-500 animate-spin" /><span className="text-xs font-semibold text-purple-600">Transcribing...</span></> :
                stt.isListening && !isThinking && !isSpeaking ? <><Mic className="w-4 h-4 text-red-500 animate-pulse" /><span className="text-xs font-semibold text-red-600">{stt.interimText || "Listening... speak now"}</span></> :
-               isSpeaking ? <><Volume2 className="w-4 h-4 text-blue-500" /><span className="text-xs font-semibold text-blue-600">{persona.displayName.split(" ")[0]} is speaking...</span><div className="flex items-end gap-0.5 h-4 ml-1">{[1,2,3,4,5].map(i => <div key={i} className="w-1 bg-blue-500 rounded-full voice-bar" style={{height:"16px"}} />)}</div></> :
-               isThinking ? <><Loader2 className="w-4 h-4 text-gray-500 animate-spin" /><span className="text-xs text-gray-600">{persona.displayName.split(" ")[0]} is thinking...</span></> :
+               isSpeaking ? <><Volume2 className="w-4 h-4 text-blue-500" /><span className="text-xs font-semibold text-blue-600">{config.displayName.split(" ")[0]} is speaking...</span><div className="flex items-end gap-0.5 h-4 ml-1">{[1,2,3,4,5].map(i => <div key={i} className="w-1 bg-blue-500 rounded-full voice-bar" style={{height:"16px"}} />)}</div></> :
+               isThinking ? <><Loader2 className="w-4 h-4 text-gray-500 animate-spin" /><span className="text-xs text-gray-600">{config.displayName.split(" ")[0]} is thinking...</span></> :
                micEnabled ? <><div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" /><span className="text-xs text-green-700">Voice active — speak naturally</span></> :
                <><span className="text-xs text-gray-500 font-semibold">Muted</span></>}
               <button onClick={() => setMicEnabled(!micEnabled)} className={`ml-2 p-1.5 rounded-full ${micEnabled ? "bg-red-100 text-red-600" : "bg-gray-100 text-gray-400"}`}>{micEnabled ? <Mic className="w-3.5 h-3.5" /> : <MicOff className="w-3.5 h-3.5" />}</button>
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-3 pr-1" style={{ maxHeight: "calc(100vh - 340px)" }}>
-              {transcript.length === 0 && <div className="text-center py-10"><div className="text-3xl mb-2">🎙️</div><p className="text-sm font-medium text-gray-600">{persona.displayName} is on the line</p><p className="text-xs text-gray-400 mt-1">Start speaking — your mic is live.</p></div>}
+              {transcript.length === 0 && <div className="text-center py-10"><p className="text-sm font-medium text-gray-600">{config.displayName} is on the line</p><p className="text-xs text-gray-400 mt-1">Start speaking — your mic is live.</p></div>}
               {transcript.map((msg, idx) => (
                 <div key={idx} className={`flex gap-2 ${msg.role === "rep" ? "flex-row-reverse" : "flex-row"}`}>
-                  <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-sm ${msg.role === "rep" ? "bg-[#1565a7] text-white" : "bg-gray-200 text-gray-600"}`}>{msg.role === "rep" ? session.repName[0]?.toUpperCase() : persona.avatar}</div>
+                  <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-semibold ${msg.role === "rep" ? "bg-[#1565a7] text-white" : "bg-gray-200 text-gray-600"}`}>{msg.role === "rep" ? "R" : config.displayName[0]}</div>
                   <div className={`max-w-[78%] flex flex-col gap-0.5 ${msg.role === "rep" ? "items-end" : "items-start"}`}>
-                    <span className={`text-[10px] text-gray-400 ${msg.role === "rep" ? "text-right" : ""}`}>{msg.role === "rep" ? session.repName : persona.displayName.split(" ")[0]}</span>
+                    <span className={`text-[10px] text-gray-400 ${msg.role === "rep" ? "text-right" : ""}`}>{msg.role === "rep" ? "You" : config.displayName.split(" ")[0]}</span>
                     <div className={`rounded px-3 py-2 text-xs leading-relaxed ${msg.role === "rep" ? "bg-[#1565a7] text-white rounded-tr-none" : "bg-gray-100 text-gray-800 border border-gray-200 rounded-tl-none"}`}>{msg.content}</div>
                   </div>
                 </div>
               ))}
-              {stt.isListening && stt.interimText && !isThinking && <div className="flex gap-2 flex-row-reverse"><div className="w-7 h-7 rounded-full bg-[#1565a7]/50 flex items-center justify-center text-sm text-white">{session.repName[0]?.toUpperCase()}</div><div className="rounded px-3 py-2 text-xs bg-[#1565a7]/30 text-[#1565a7] rounded-tr-none italic">{stt.interimText}...</div></div>}
-              {isThinking && <div className="flex gap-2"><div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center text-sm">{persona.avatar}</div><div className="bg-gray-100 border border-gray-200 rounded rounded-tl-none px-3 py-2"><div className="flex gap-1"><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" /><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:"150ms"}} /><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:"300ms"}} /></div></div></div>}
+              {stt.isListening && stt.interimText && !isThinking && <div className="flex gap-2 flex-row-reverse"><div className="w-7 h-7 rounded-full bg-[#1565a7]/50 flex items-center justify-center text-xs text-white font-semibold">R</div><div className="rounded px-3 py-2 text-xs bg-[#1565a7]/30 text-[#1565a7] rounded-tr-none italic">{stt.interimText}...</div></div>}
+              {isThinking && <div className="flex gap-2"><div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center text-xs font-semibold">{config.displayName[0]}</div><div className="bg-gray-100 border border-gray-200 rounded rounded-tl-none px-3 py-2"><div className="flex gap-1"><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" /><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:"150ms"}} /><div className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{animationDelay:"300ms"}} /></div></div></div>}
               <div ref={chatEndRef} />
             </div>
 

@@ -28,7 +28,7 @@ export default function History() {
           <div className="grid grid-cols-3 gap-4 mb-6">
             <div className="border rounded-xl p-4 text-center"><p className="text-2xl font-bold text-[#1565a7]">{avgScore}</p><p className="text-xs text-gray-500 mt-1">Avg Score</p></div>
             <div className="border rounded-xl p-4 text-center"><p className="text-2xl font-bold">{completed.length}</p><p className="text-xs text-gray-500 mt-1">Calls</p></div>
-            <div className="border rounded-xl p-4 text-center"><p className="text-2xl font-bold">{avgScore >= 75 ? "🏆" : avgScore >= 55 ? "📈" : "⚠️"}</p><p className="text-xs text-gray-500 mt-1">Grade</p></div>
+            <div className="border rounded-xl p-4 text-center"><p className="text-2xl font-bold">{avgScore >= 75 ? "A" : avgScore >= 55 ? "B" : "C"}</p><p className="text-xs text-gray-500 mt-1">Grade</p></div>
           </div>
         )}
 
@@ -43,6 +43,10 @@ export default function History() {
           <div className="space-y-3">
             {[...sessions].reverse().map(s => {
               const persona = PERSONAS[s.personaId];
+              const cfg = s.callConfig;
+              const displayName = cfg?.displayName || persona?.displayName || "Prospect";
+              const company = cfg?.company || persona?.company || "";
+              const initial = displayName[0] || "?";
               const score = s.scorecardJson?.overallScore;
               const scoreColor = !score ? "text-gray-400" : score >= 75 ? "text-green-600" : score >= 55 ? "text-yellow-600" : "text-red-600";
               return (
@@ -50,10 +54,10 @@ export default function History() {
                   onClick={() => s.status === "completed" ? navigate(`/scorecard/${s.id}`) : navigate(`/call/${s.id}`)}>
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className="text-2xl">{persona?.avatar}</div>
+                      <div className="w-9 h-9 rounded-full bg-[#1565a7] text-white flex items-center justify-center font-semibold">{initial}</div>
                       <div>
-                        <p className="text-sm font-medium">{persona?.displayName}</p>
-                        <p className="text-xs text-gray-500">{persona?.company}</p>
+                        <p className="text-sm font-medium">{displayName}</p>
+                        <p className="text-xs text-gray-500">{company}</p>
                         <div className="flex items-center gap-2 mt-1">
                           <span className={`text-xs px-2 py-0.5 rounded-full ${s.status === "completed" ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-600"}`}>{s.status === "completed" ? "Completed" : "In Progress"}</span>
                           <span className="text-xs text-gray-500">{new Date(s.startedAt).toLocaleDateString()}</span>

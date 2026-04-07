@@ -1,10 +1,22 @@
 // Client-side session storage using localStorage
 
+import type { CallConfig } from "./jobs";
+
+export interface StoredScript {
+  fileName: string;
+  mimeType: string;
+  text: string;
+  html: string;
+  dataUrl: string;
+}
+
 export interface Session {
   id: number;
-  personaId: string;
+  personaId: string;        // Legacy field — kept for backward compatibility
   productId: string;
-  repName: string;
+  repName: string;          // Legacy field — defaulted to "Sales Rep"
+  callConfig?: CallConfig;
+  script?: StoredScript;
   status: "active" | "completed";
   startedAt: string;
   endedAt: string | null;
@@ -30,12 +42,18 @@ let nextId = (() => {
   return sessions.length > 0 ? Math.max(...sessions.map(s => s.id)) + 1 : 1;
 })();
 
-export function createSession(personaId: string, productId: string, repName: string): Session {
+export function createSession(opts: {
+  productId: string;
+  callConfig: CallConfig;
+  script?: StoredScript;
+}): Session {
   const session: Session = {
     id: nextId++,
-    personaId,
-    productId,
-    repName,
+    personaId: opts.callConfig.jobTitleId,
+    productId: opts.productId,
+    repName: "Sales Rep",
+    callConfig: opts.callConfig,
+    script: opts.script,
     status: "active",
     startedAt: new Date().toISOString(),
     endedAt: null,
