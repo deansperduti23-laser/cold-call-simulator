@@ -17,8 +17,22 @@ let nextStartTime = 0;
 
 // Kokoro outputs at 24 kHz.
 const KOKORO_SAMPLE_RATE = 24000;
-const IS_FIREFOX = typeof navigator !== "undefined" &&
-  (/Firefox\//i.test(navigator.userAgent) || /Gecko\//.test(navigator.userAgent) && !/like Gecko/.test(navigator.userAgent));
+
+// Positively identify Chromium-based browsers for the low-latency streaming
+// Web Audio path. EVERYTHING ELSE (Firefox, Safari, anything spoofed,
+// anything we're not sure about) falls through to the reliable WAV blob +
+// HTMLAudioElement path.
+function isChromium(): boolean {
+  if (typeof navigator === "undefined" || typeof window === "undefined") return false;
+  // Firefox & Safari short-circuit
+  if (/Firefox|FxiOS/i.test(navigator.userAgent)) return false;
+  if (/^((?!chrome|android).)*safari/i.test(navigator.userAgent)) return false;
+  // Has the chrome global AND is Blink-based
+  if (!(window as any).chrome) return false;
+  return /Chrome|Chromium|Edg|OPR/.test(navigator.userAgent);
+}
+const USE_STREAMING_WEBAUDIO = isChromium();
+console.log("[Kokoro] playback path =", USE_STREAMING_WEBAUDIO ? "Web Audio streaming (Chromium)" : "HTMLAudioElement WAV (universal)");
 
 /** Pack Float32 mono samples into a 16-bit PCM WAV Blob. */
 function float32ToWavBlob(samples: Float32Array, sampleRate: number): Blob {
@@ -314,12 +328,13 @@ export async function streamSpeakWithKokoro(
     await ensureContextRunning(ctx);
     nextStartTime = 0;
 
-    if (IS_FIREFOX) {
-      // Firefox: collect every chunk, concatenate, encode as a real WAV
-      // Blob, and play through HTMLAudioElement. Bypasses Web Audio
-      // entirely — no AudioContext suspension issues, no boundary
-      // glitches between sources, no live resampling crackle.
-      console.log("[Kokoro] using Firefox HTMLAudioElement path");
+    if (!USE_STREAMING_WEBAUDIO) {
+      // Universal path: collect every chunk, concatenate, encode as a real
+      // WAV blob, play through HTMLAudioElement. Bypasses Web Audio
+      // entirely — no AudioContext suspension issues, no boundary glitches
+      // between sources, no live resampling crackle. Used everywhere
+      // except positively-identified Chromium.
+      console.log("[Kokoro] WAV/HTMLAudio path engaged");
       const collected: Float32Array[] = [];
       let sr = KOKORO_SAMPLE_RATE;
       while (!isAborted()) {
