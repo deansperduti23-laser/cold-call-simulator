@@ -30,7 +30,8 @@
       "Bash(gh api:*)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://deansperduti23-laser.github.io/cold-call-simulator/)",
       "Bash(npx tsc:*)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(find node_modules/@huggingface/transformers -name audio*.js)"
     ]
   }
 }

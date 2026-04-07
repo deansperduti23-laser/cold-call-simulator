@@ -7,6 +7,7 @@ import { buildCallSystemPrompt } from "@/lib/prompts";
 import { groqChat, groqWhisper } from "@/lib/groq-client";
 import { createSession, getSession, updateSession, addMessageToSession, type Session, type StoredScript } from "@/lib/sessions";
 import { parseScriptFile, getAcceptedFileTypes } from "@/lib/file-parser";
+import { preloadKokoro, speakWithKokoro, stopKokoro } from "@/lib/kokoro-tts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
@@ -74,6 +75,10 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
 
   const hot = JOB_TITLES.filter(j => j.hot);
   const others = JOB_TITLES.filter(j => !j.hot);
+
+  // Kick off the Kokoro model download as soon as the intro is open so
+  // the first call doesn't pay the full cold-start cost.
+  useEffect(() => { preloadKokoro(); }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -204,14 +209,15 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
 
           {error && <p className="text-red-600 text-xs font-medium">{error}</p>}
           <button onClick={handleStart} className="w-full bg-[#1565a7] hover:bg-[#1255a0] text-white font-semibold py-2 rounded transition-colors flex items-center justify-center gap-2 text-sm"><Phone className="w-4 h-4" /> Start Voice Call</button>
+          <p className="text-[10px] text-gray-400 text-center">Powered by Kokoro TTS — downloading lifelike voice model in the background (~100 MB, cached after first load).</p>
         </div>
       </div>
     </div>
   );
 }
 
-// ── Web Speech TTS (gender-aware) ────────────────────────────────────────────
-function speakText(text: string, gender: Gender, onStart?: () => void, onEnd?: () => void) {
+// ── TTS: Kokoro (lifelike, in-browser) with Web Speech API fallback ─────────
+function speakWebSpeech(text: string, gender: Gender, onStart?: () => void, onEnd?: () => void) {
   if (!window.speechSynthesis) { onEnd?.(); return; }
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
@@ -232,6 +238,20 @@ function speakText(text: string, gender: Gender, onStart?: () => void, onEnd?: (
   utterance.onend = () => onEnd?.();
   utterance.onerror = () => onEnd?.();
   window.speechSynthesis.speak(utterance);
+}
+
+// Prefer Kokoro — on any failure fall back transparently to Web Speech.
+async function speakText(text: string, gender: Gender, onStart?: () => void, onEnd?: () => void) {
+  try {
+    await speakWithKokoro(text, gender, onStart, onEnd);
+  } catch {
+    speakWebSpeech(text, gender, onStart, onEnd);
+  }
+}
+
+function cancelAllSpeech() {
+  stopKokoro();
+  window.speechSynthesis?.cancel();
 }
 
 if (typeof window !== "undefined") {
@@ -543,7 +563,7 @@ export default function Call() {
 
   const stt = useAlwaysOnSTT((text) => sendToAI(text), micEnabled, apiKey);
 
-  const handleSend = () => { const t = input.trim(); if (!t || isThinking) return; setInput(""); window.speechSynthesis?.cancel(); stt.pause(); sendToAI(t); };
+  const handleSend = () => { const t = input.trim(); if (!t || isThinking) return; setInput(""); cancelAllSpeech(); stt.pause(); sendToAI(t); };
 
   const handleIntroStart = (r: IntroResult) => {
     setApiKey(r.apiKey);
@@ -568,7 +588,7 @@ export default function Call() {
   const advanceToNextCall = useCallback(() => {
     if (!introOptsRef.current) return;
     if (timerRef.current) clearInterval(timerRef.current);
-    window.speechSynthesis?.cancel();
+    cancelAllSpeech();
     setMicEnabled(false);
     setTranscript([]); setGrades([]); setCallDuration(0);
     setSelectedResult(""); setNotes(""); setInput("");
