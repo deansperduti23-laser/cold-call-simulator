@@ -18,6 +18,9 @@ let nextStartTime = 0;
 // Kokoro outputs at 24 kHz. Chromium-only — Firefox audio output was
 // unfixable across multiple approaches and is officially unsupported.
 const KOKORO_SAMPLE_RATE = 24000;
+// Slightly speed up playback to make the AI sound more energetic and
+// natural for a phone-call cadence (Kokoro's default rate is a bit slow).
+const PLAYBACK_RATE = 1.15;
 
 export function isFirefox(): boolean {
   return typeof navigator !== "undefined" && /Firefox|FxiOS/i.test(navigator.userAgent);
@@ -150,13 +153,33 @@ export function preloadKokoro(): Promise<void> {
 }
 
 let _ready = false;
-getTTS().then(() => { _ready = true; }).catch(() => {});
+let _warmupPromise: Promise<void> | null = null;
+
+async function warmup(): Promise<void> {
+  if (_warmupPromise) return _warmupPromise;
+  _warmupPromise = (async () => {
+    try {
+      const tts = await getTTS();
+      // Run a tiny throwaway generation so the very first real call
+      // doesn't pay the model warmup cost (~2-4 s on first inference).
+      await tts.generate("Hi.", { voice: "am_michael" });
+      _ready = true;
+    } catch (e) {
+      console.warn("[Kokoro] warmup failed", e);
+      _ready = true; // still mark ready so UI doesn't hang
+    }
+  })();
+  return _warmupPromise;
+}
+
+// Kick off model load + warmup at module import time.
+warmup();
 
 export function isKokoroReady(): boolean { return _ready; }
 
-/** Resolves when the Kokoro model is fully loaded and ready to synthesize. */
+/** Resolves when the Kokoro model is fully loaded AND warmed up. */
 export function kokoroReady(): Promise<void> {
-  return getTTS().then(() => { _ready = true; });
+  return warmup();
 }
 
 export function stopKokoro(): void {
@@ -204,6 +227,7 @@ export async function speakWithKokoro(
     buffer.getChannelData(0).set(owned);
     const src = ctx.createBufferSource();
     src.buffer = buffer;
+    src.playbackRate.value = PLAYBACK_RATE;
     src.connect(ctx.destination);
     scheduledSources.push(src);
     onStart?.();
@@ -298,10 +322,11 @@ export async function streamSpeakWithKokoro(
       buffer.getChannelData(0).set(owned);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
+      src.playbackRate.value = PLAYBACK_RATE;
       src.connect(ctx.destination);
       const startAt = Math.max(ctx.currentTime + 0.02, nextStartTime);
       try { src.start(startAt); } catch { continue; }
-      nextStartTime = startAt + buffer.duration;
+      nextStartTime = startAt + (buffer.duration / PLAYBACK_RATE);
       scheduledSources.push(src);
       if (!playedFirst) {
         playedFirst = true;
