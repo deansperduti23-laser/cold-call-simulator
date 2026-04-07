@@ -4,10 +4,10 @@ import { Loader2, PhoneOff, Send, AlertTriangle, Mic, MicOff, Phone, Volume2, Up
 import { PRODUCTS, DEFAULT_PRODUCT_ID } from "@/lib/personas";
 import { JOB_TITLES, SCENARIOS, generateCallConfig, type CallConfig, type Gender } from "@/lib/jobs";
 import { buildCallSystemPrompt } from "@/lib/prompts";
-import { groqChat, groqWhisper } from "@/lib/groq-client";
+import { groqChatStream, groqWhisper } from "@/lib/groq-client";
 import { createSession, getSession, updateSession, addMessageToSession, type Session, type StoredScript } from "@/lib/sessions";
 import { parseScriptFile, getAcceptedFileTypes } from "@/lib/file-parser";
-import { preloadKokoro, speakWithKokoro, stopKokoro } from "@/lib/kokoro-tts";
+import { preloadKokoro, streamSpeakWithKokoro, stopKokoro, KOKORO_VOICES, pickRandomVoice } from "@/lib/kokoro-tts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
@@ -58,6 +58,7 @@ interface IntroResult {
   scenarioId: string;
   customPrompt: string;
   gender: Gender;
+  voice: string; // "" = auto/random based on gender
   script: StoredScript | null;
 }
 
@@ -67,6 +68,7 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
   const [scenarioId, setScenarioId] = useState<string>("standard");
   const [customPrompt, setCustomPrompt] = useState<string>(() => localStorage.getItem("custom_prompt") || "");
   const [gender, setGender] = useState<Gender>("male");
+  const [voiceId, setVoiceId] = useState<string>(() => localStorage.getItem("voice_id") || "");
   const [showConfig, setShowConfig] = useState(false);
   const [error, setError] = useState("");
   const [script, setScript] = useState<StoredScript | null>(null);
@@ -102,7 +104,8 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
     if (scenarioId === "custom" && !customPrompt.trim()) { setError("Custom prompt cannot be empty"); return; }
     localStorage.setItem("groq_api_key", apiKey.trim());
     if (scenarioId === "custom") localStorage.setItem("custom_prompt", customPrompt);
-    onStart({ apiKey: apiKey.trim(), jobTitleId: selectedJob, scenarioId, customPrompt, gender, script });
+    localStorage.setItem("voice_id", voiceId);
+    onStart({ apiKey: apiKey.trim(), jobTitleId: selectedJob, scenarioId, customPrompt, gender, voice: voiceId, script });
   };
 
   const renderJobButton = (j: typeof JOB_TITLES[number]) => (
@@ -173,6 +176,14 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
                     </div>
                   </div>
                 </div>
+                <div>
+                  <label className="text-[10px] font-semibold text-gray-600 block">Voice (Kokoro)</label>
+                  <select value={voiceId} onChange={e => setVoiceId(e.target.value)}
+                    className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-[#1565a7]">
+                    <option value="">Auto (random for gender)</option>
+                    {KOKORO_VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
+                  </select>
+                </div>
                 {scenarioId === "custom" && (
                   <textarea value={customPrompt} onChange={e => setCustomPrompt(e.target.value)}
                     placeholder="Describe how the prospect should behave..."
@@ -240,14 +251,8 @@ function speakWebSpeech(text: string, gender: Gender, onStart?: () => void, onEn
   window.speechSynthesis.speak(utterance);
 }
 
-// Prefer Kokoro — on any failure fall back transparently to Web Speech.
-async function speakText(text: string, gender: Gender, onStart?: () => void, onEnd?: () => void) {
-  try {
-    await speakWithKokoro(text, gender, onStart, onEnd);
-  } catch {
-    speakWebSpeech(text, gender, onStart, onEnd);
-  }
-}
+// Public alias used by streaming pipeline as the safety-net fallback.
+const speakWebSpeechFallback = speakWebSpeech;
 
 function cancelAllSpeech() {
   stopKokoro();
@@ -317,7 +322,7 @@ function useAlwaysOnSTT(onFinalResult: (text: string) => void, enabled: boolean,
 
   const resume = useCallback(() => {
     pausedRef.current = false; setInterimText("");
-    setTimeout(() => startListeningCycle(), 300);
+    setTimeout(() => startListeningCycle(), 100);
   }, [startListeningCycle]);
 
   useEffect(() => {
@@ -353,7 +358,7 @@ function useAlwaysOnSTT(onFinalResult: (text: string) => void, enabled: boolean,
           if (hasSpeechRef.current && isRecordingRef.current) {
             setIsListening(false);
             await stopRecordingAndTranscribe();
-            if (enabledRef.current && !pausedRef.current) setTimeout(() => startListeningCycle(), 300);
+            if (enabledRef.current && !pausedRef.current) setTimeout(() => startListeningCycle(), 100);
           } else {
             if (isRecordingRef.current && mediaRecorderRef.current) { mediaRecorderRef.current.onstop = () => { isRecordingRef.current = false; }; try { mediaRecorderRef.current.stop(); } catch {} }
             if (enabledRef.current && !pausedRef.current) setTimeout(() => startListeningCycle(), 200);
@@ -537,24 +542,55 @@ export default function Call() {
     addMessageToSession(sessionId, "rep", repText);
 
     try {
-      const systemPrompt = buildCallSystemPrompt(callConfigRef.current, DEFAULT_PRODUCT_ID, session?.script?.text);
-      const reply = await groqChat(apiKey, systemPrompt, newTranscript.slice(0, -1), repText);
-      const fullTranscript: Message[] = [...newTranscript, { role: "prospect", content: reply }];
-      setTranscript(fullTranscript);
-      addMessageToSession(sessionId, "prospect", reply);
-      setIsThinking(false);
+      const cfg = callConfigRef.current;
+      const systemPrompt = buildCallSystemPrompt(cfg, DEFAULT_PRODUCT_ID, session?.script?.text);
 
-      const repMsgs = fullTranscript.filter(m => m.role === "rep");
-      const prospectMsgs = fullTranscript.filter(m => m.role === "prospect");
-      const lastRep = repMsgs[repMsgs.length - 1]; const lastProspect = prospectMsgs[prospectMsgs.length - 1];
-      if (lastRep && lastProspect) {
-        const { grade, note } = gradeExchange(lastRep.content, lastProspect.content);
-        setGrades(prev => [...prev, { exchange: prev.length + 1, repText: lastRep.content, prospectText: lastProspect.content, grade, note }]);
+      // Stream LLM response and pipe tokens directly into Kokoro streaming TTS
+      // so playback starts as soon as the first sentence is ready.
+      let placeholderAdded = false;
+      const tokenIter = (async function* () {
+        for await (const tok of groqChatStream(apiKey, systemPrompt, newTranscript.slice(0, -1), repText)) {
+          if (!placeholderAdded) {
+            placeholderAdded = true;
+            setIsThinking(false);
+            setTranscript(t => [...t, { role: "prospect", content: "" }]);
+          }
+          setTranscript(t => {
+            const copy = [...t];
+            const last = copy[copy.length - 1];
+            if (last && last.role === "prospect") copy[copy.length - 1] = { ...last, content: last.content + tok };
+            return copy;
+          });
+          yield tok;
+        }
+      })();
+
+      let fullReply = "";
+      try {
+        fullReply = await streamSpeakWithKokoro(
+          tokenIter,
+          { voice: cfg.voice, gender: cfg.gender },
+          {
+            onFirstAudio: () => setIsSpeaking(true),
+            onComplete: () => { setIsSpeaking(false); stt.resume(); },
+          },
+        );
+      } catch {
+        // Fallback: collect remaining tokens, then Web Speech
+        for await (const _ of tokenIter) { /* drain */ }
+        const reply = fullReply || (transcript.length ? "" : "");
+        if (reply) speakWebSpeechFallback(reply, cfg.gender, () => setIsSpeaking(true), () => { setIsSpeaking(false); stt.resume(); });
+        else { setIsSpeaking(false); stt.resume(); }
       }
 
-      if (reply) {
-        speakText(reply, callConfigRef.current.gender, () => setIsSpeaking(true), () => { setIsSpeaking(false); stt.resume(); });
-      } else { stt.resume(); }
+      // Persist final transcript & grade exchange
+      addMessageToSession(sessionId, "prospect", fullReply);
+      const lastRep = repText;
+      const lastProspect = fullReply;
+      if (lastRep && lastProspect) {
+        const { grade, note } = gradeExchange(lastRep, lastProspect);
+        setGrades(prev => [...prev, { exchange: prev.length + 1, repText: lastRep, prospectText: lastProspect, grade, note }]);
+      }
     } catch (err: any) {
       setIsThinking(false); stt.resume();
       setVoiceError(err.message || String(err));
@@ -576,6 +612,7 @@ export default function Call() {
     runIdRef.current = newRunId;
     localStorage.setItem("current_run_id", newRunId);
     const config = generateCallConfig({ ...opts, gender: r.gender });
+    config.voice = r.voice || pickRandomVoice(r.gender);
     callConfigRef.current = config;
     const s = createSession({ productId: DEFAULT_PRODUCT_ID, callConfig: config, script: r.script ?? undefined, runId: newRunId });
     setSession(s); setSessionId(s.id);
@@ -594,6 +631,9 @@ export default function Call() {
     setSelectedResult(""); setNotes(""); setInput("");
     const newGender = (Math.random() < 0.5 ? "male" : "female") as Gender;
     const config = generateCallConfig({ ...introOptsRef.current, gender: newGender });
+    // Always pick a fresh random voice on advance — voice settings are
+    // randomized per call, but the prompt (job/scenario/customPrompt) stays.
+    config.voice = pickRandomVoice(newGender);
     callConfigRef.current = config;
     const previousScript = session?.script;
     const s = createSession({ productId: DEFAULT_PRODUCT_ID, callConfig: config, script: previousScript, runId: runIdRef.current ?? undefined });

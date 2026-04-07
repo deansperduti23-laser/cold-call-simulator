@@ -15,6 +15,33 @@ const VOICE_BY_GENDER: Record<Gender, string> = {
   male: "am_michael",
 };
 
+export interface VoiceOption { id: string; label: string; gender: Gender; }
+
+// Curated set of high-quality American English voices.
+export const KOKORO_VOICES: VoiceOption[] = [
+  { id: "af_heart",   label: "Heart (F)",   gender: "female" },
+  { id: "af_bella",   label: "Bella (F)",   gender: "female" },
+  { id: "af_nicole",  label: "Nicole (F)",  gender: "female" },
+  { id: "af_sarah",   label: "Sarah (F)",   gender: "female" },
+  { id: "af_sky",     label: "Sky (F)",     gender: "female" },
+  { id: "af_nova",    label: "Nova (F)",    gender: "female" },
+  { id: "am_michael", label: "Michael (M)", gender: "male" },
+  { id: "am_adam",    label: "Adam (M)",    gender: "male" },
+  { id: "am_eric",    label: "Eric (M)",    gender: "male" },
+  { id: "am_liam",    label: "Liam (M)",    gender: "male" },
+  { id: "am_onyx",    label: "Onyx (M)",    gender: "male" },
+  { id: "am_puck",    label: "Puck (M)",    gender: "male" },
+];
+
+export function pickRandomVoice(gender?: Gender): string {
+  const pool = gender ? KOKORO_VOICES.filter(v => v.gender === gender) : KOKORO_VOICES;
+  return pool[Math.floor(Math.random() * pool.length)].id;
+}
+
+export function voiceGender(voiceId: string): Gender {
+  return KOKORO_VOICES.find(v => v.id === voiceId)?.gender || "male";
+}
+
 async function getTTS(): Promise<TTSInstance> {
   if (!ttsPromise) {
     ttsPromise = (async () => {
@@ -67,25 +94,28 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+function resolveVoice(opts: { voice?: string; gender?: Gender }): string {
+  if (opts.voice && KOKORO_VOICES.some(v => v.id === opts.voice)) return opts.voice;
+  if (opts.gender) return VOICE_BY_GENDER[opts.gender];
+  return "am_michael";
+}
+
 export async function speakWithKokoro(
   text: string,
-  gender: Gender,
+  opts: { voice?: string; gender?: Gender },
   onStart?: () => void,
   onEnd?: () => void,
 ): Promise<void> {
   stopKokoro();
   try {
-    // Cap the first-load wait at 60s so we don't hang forever if the model
-    // download stalls. Subsequent calls hit cached weights and are fast.
     const tts = await withTimeout(getTTS(), 60_000, "Kokoro model load");
-    const voice = VOICE_BY_GENDER[gender] || "am_michael";
+    const voice = resolveVoice(opts);
     const result: any = await withTimeout(tts.generate(text, { voice }), 30_000, "Kokoro generate");
     const blob: Blob = typeof result.toBlob === "function" ? result.toBlob() : result;
     const url = URL.createObjectURL(blob);
     currentUrl = url;
     const el = new Audio(url);
-    el.volume = 1;
-    el.muted = false;
+    el.volume = 1; el.muted = false;
     currentAudio = el;
     el.onplay = () => onStart?.();
     el.onended = () => { stopKokoro(); onEnd?.(); };
@@ -94,6 +124,102 @@ export async function speakWithKokoro(
   } catch (err) {
     console.error("[Kokoro] speak failed", err);
     stopKokoro();
+    throw err;
+  }
+}
+
+/**
+ * Stream audio: feed text incrementally and start playback as soon as
+ * the first sentence is synthesized. Cuts perceived latency dramatically
+ * when wired up to a streaming LLM response.
+ *
+ * Returns a Promise that resolves when ALL audio has finished playing.
+ */
+export async function streamSpeakWithKokoro(
+  textChunks: AsyncIterable<string>,
+  opts: { voice?: string; gender?: Gender },
+  callbacks?: { onFirstAudio?: () => void; onAllText?: (full: string) => void; onComplete?: () => void; shouldAbort?: () => boolean },
+): Promise<string> {
+  stopKokoro();
+  let fullText = "";
+  let aborted = false;
+  const isAborted = () => aborted || (callbacks?.shouldAbort?.() ?? false);
+
+  try {
+    const tts = await withTimeout(getTTS(), 60_000, "Kokoro model load");
+    const { TextSplitterStream } = await import("kokoro-js");
+    const voice = resolveVoice(opts);
+    const splitter = new TextSplitterStream();
+    const audioStream = tts.stream(splitter, { voice });
+
+    // Producer 1: pipe LLM tokens into the splitter
+    const producer = (async () => {
+      for await (const chunk of textChunks) {
+        if (isAborted()) break;
+        fullText += chunk;
+        splitter.push(chunk);
+      }
+      splitter.close();
+      callbacks?.onAllText?.(fullText);
+    })();
+
+    // Producer 2: collect audio chunks emitted from kokoro
+    const audioQueue: Blob[] = [];
+    let queueWaiter: { fn: (() => void) | null } = { fn: null };
+    let producerDone = false;
+    const collector = (async () => {
+      try {
+        for await (const item of audioStream as any) {
+          if (isAborted()) break;
+          const audio = item?.audio;
+          if (!audio) continue;
+          const blob: Blob = typeof audio.toBlob === "function" ? audio.toBlob() : audio;
+          audioQueue.push(blob);
+          const w = queueWaiter.fn; queueWaiter.fn = null; w?.();
+        }
+      } catch (e) {
+        console.error("[Kokoro] audio stream error", e);
+      } finally {
+        producerDone = true;
+        const w = queueWaiter.fn; queueWaiter.fn = null; w?.();
+      }
+    })();
+
+    // Consumer: play queued blobs in order
+    let playedFirst = false;
+    while (!isAborted()) {
+      if (audioQueue.length === 0) {
+        if (producerDone) break;
+        await new Promise<void>(r => { queueWaiter.fn = r; });
+        continue;
+      }
+      const blob = audioQueue.shift()!;
+      const url = URL.createObjectURL(blob);
+      currentUrl = url;
+      const el = new Audio(url);
+      el.volume = 1; el.muted = false;
+      currentAudio = el;
+      if (!playedFirst) {
+        playedFirst = true;
+        callbacks?.onFirstAudio?.();
+      }
+      await new Promise<void>((res) => {
+        el.onended = () => { try { URL.revokeObjectURL(url); } catch {}; res(); };
+        el.onerror = () => { try { URL.revokeObjectURL(url); } catch {}; res(); };
+        el.play().catch(() => res());
+      });
+      if (isAborted()) break;
+    }
+
+    await producer.catch(() => {});
+    await collector.catch(() => {});
+    stopKokoro();
+    callbacks?.onComplete?.();
+    return fullText;
+  } catch (err) {
+    aborted = true;
+    stopKokoro();
+    console.error("[Kokoro] streamSpeak failed", err);
     throw err;
   }
 }

@@ -94,6 +94,7 @@ export interface CallConfig {
   gender: Gender;
   displayName: string;
   company: string;
+  voice?: string; // Kokoro voice id; if omitted, defaults from gender
 }
 
 export function generateCallConfig(opts: {
