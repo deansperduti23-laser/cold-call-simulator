@@ -15,14 +15,46 @@ let audioCtx: AudioContext | null = null;
 let scheduledSources: AudioBufferSourceNode[] = [];
 let nextStartTime = 0;
 
+// Kokoro outputs at 24 kHz. Forcing the AudioContext to the same rate
+// avoids the browser's automatic resampling step (Firefox in particular
+// produced loud crackling when resampling 24 kHz → 48 kHz live).
+const KOKORO_SAMPLE_RATE = 24000;
+
 function getAudioContext(): AudioContext {
   if (!audioCtx || audioCtx.state === "closed") {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const Ctor = window.AudioContext || (window as any).webkitAudioContext;
+    try {
+      audioCtx = new Ctor({ sampleRate: KOKORO_SAMPLE_RATE });
+    } catch {
+      // Some platforms reject non-standard sample rates — fall back to default.
+      audioCtx = new Ctor();
+    }
   }
   if (audioCtx.state === "suspended") {
     audioCtx.resume().catch(() => {});
   }
   return audioCtx;
+}
+
+/**
+ * MUST be called from inside a user-gesture handler (e.g. button click).
+ * Firefox keeps the AudioContext suspended until a user gesture explicitly
+ * resumes it; without this, no Web Audio output ever plays. Also primes
+ * the context with a silent buffer to fully unlock playback.
+ */
+export function unlockAudio(): void {
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    // Play a 1-sample silent buffer to mark the context as user-activated
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    src.start(0);
+  } catch (e) {
+    console.warn("[Kokoro] unlockAudio failed", e);
+  }
 }
 
 function stopWebAudio() {
@@ -145,8 +177,10 @@ export async function speakWithKokoro(
     const samples: Float32Array = result.audio;
     const sampleRate: number = result.sampling_rate || 24000;
     const ctx = getAudioContext();
-    const buffer = ctx.createBuffer(1, samples.length, sampleRate);
-    buffer.copyToChannel(samples, 0);
+    const owned = new Float32Array(samples.length);
+    owned.set(samples);
+    const buffer = ctx.createBuffer(1, owned.length, sampleRate);
+    buffer.getChannelData(0).set(owned);
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
@@ -237,8 +271,11 @@ export async function streamSpeakWithKokoro(
         continue;
       }
       const chunk = audioQueue.shift()!;
-      const buffer = ctx.createBuffer(1, chunk.samples.length, chunk.sampleRate);
-      buffer.copyToChannel(chunk.samples, 0);
+      // Detach from any shared underlying ArrayBuffer the model may reuse
+      const owned = new Float32Array(chunk.samples.length);
+      owned.set(chunk.samples);
+      const buffer = ctx.createBuffer(1, owned.length, chunk.sampleRate);
+      buffer.getChannelData(0).set(owned);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(ctx.destination);

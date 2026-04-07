@@ -7,7 +7,7 @@ import { buildCallSystemPrompt } from "@/lib/prompts";
 import { groqChatStream, groqWhisper } from "@/lib/groq-client";
 import { createSession, getSession, updateSession, addMessageToSession, type Session, type StoredScript } from "@/lib/sessions";
 import { parseScriptFile, getAcceptedFileTypes } from "@/lib/file-parser";
-import { preloadKokoro, kokoroReady, isKokoroReady, streamSpeakWithKokoro, stopKokoro, KOKORO_VOICES, pickRandomVoice, voiceGender } from "@/lib/kokoro-tts";
+import { preloadKokoro, kokoroReady, isKokoroReady, streamSpeakWithKokoro, stopKokoro, unlockAudio, KOKORO_VOICES, pickRandomVoice, voiceGender } from "@/lib/kokoro-tts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
@@ -108,6 +108,9 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
     if (!selectedJob) { setError("Select a position to call"); return; }
     if (scenarioId === "custom" && !customPrompt.trim()) { setError("Custom prompt cannot be empty"); return; }
     if (!voiceLoaded) { setError("Voice model is still loading. Please wait..."); return; }
+    // Unlock the AudioContext from this user-gesture click — required for
+    // Firefox (and Safari) to allow Web Audio playback later from async code.
+    unlockAudio();
     localStorage.setItem("groq_api_key", apiKey.trim());
     if (scenarioId === "custom") localStorage.setItem("custom_prompt", customPrompt);
     localStorage.setItem("voice_id", voiceId);
