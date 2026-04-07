@@ -7,7 +7,7 @@ import { buildCallSystemPrompt } from "@/lib/prompts";
 import { groqChatStream, groqWhisper } from "@/lib/groq-client";
 import { createSession, getSession, updateSession, addMessageToSession, type Session, type StoredScript } from "@/lib/sessions";
 import { parseScriptFile, getAcceptedFileTypes } from "@/lib/file-parser";
-import { preloadKokoro, streamSpeakWithKokoro, stopKokoro, KOKORO_VOICES, pickRandomVoice } from "@/lib/kokoro-tts";
+import { preloadKokoro, kokoroReady, isKokoroReady, streamSpeakWithKokoro, stopKokoro, KOKORO_VOICES, pickRandomVoice, voiceGender } from "@/lib/kokoro-tts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 interface Message { role: "rep" | "prospect"; content: string; }
@@ -67,8 +67,8 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
   const [selectedJob, setSelectedJob] = useState<string>("");
   const [scenarioId, setScenarioId] = useState<string>("standard");
   const [customPrompt, setCustomPrompt] = useState<string>(() => localStorage.getItem("custom_prompt") || "");
-  const [gender, setGender] = useState<Gender>("male");
   const [voiceId, setVoiceId] = useState<string>(() => localStorage.getItem("voice_id") || "");
+  const [voiceLoaded, setVoiceLoaded] = useState<boolean>(() => isKokoroReady());
   const [showConfig, setShowConfig] = useState(false);
   const [error, setError] = useState("");
   const [script, setScript] = useState<StoredScript | null>(null);
@@ -79,8 +79,13 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
   const others = JOB_TITLES.filter(j => !j.hot);
 
   // Kick off the Kokoro model download as soon as the intro is open so
-  // the first call doesn't pay the full cold-start cost.
-  useEffect(() => { preloadKokoro(); }, []);
+  // the first call doesn't pay the full cold-start cost. Disable Start
+  // until the model is fully loaded so the very first turn is instant.
+  useEffect(() => {
+    let cancelled = false;
+    kokoroReady().then(() => { if (!cancelled) setVoiceLoaded(true); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -102,10 +107,14 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
     if (!apiKey.trim()) { setError("Groq API key is required. Get one free at console.groq.com/keys"); return; }
     if (!selectedJob) { setError("Select a position to call"); return; }
     if (scenarioId === "custom" && !customPrompt.trim()) { setError("Custom prompt cannot be empty"); return; }
+    if (!voiceLoaded) { setError("Voice model is still loading. Please wait..."); return; }
     localStorage.setItem("groq_api_key", apiKey.trim());
     if (scenarioId === "custom") localStorage.setItem("custom_prompt", customPrompt);
     localStorage.setItem("voice_id", voiceId);
-    onStart({ apiKey: apiKey.trim(), jobTitleId: selectedJob, scenarioId, customPrompt, gender, voice: voiceId, script });
+    // Resolve voice → derive gender from it (no separate gender setting).
+    const resolvedVoice = voiceId || pickRandomVoice();
+    const resolvedGender = voiceGender(resolvedVoice);
+    onStart({ apiKey: apiKey.trim(), jobTitleId: selectedJob, scenarioId, customPrompt, gender: resolvedGender, voice: resolvedVoice, script });
   };
 
   const renderJobButton = (j: typeof JOB_TITLES[number]) => (
@@ -156,33 +165,21 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
             </button>
             {showConfig && (
               <div className="px-2 pb-2 space-y-2 border-t border-gray-200 pt-2">
-                <div className="flex gap-2 items-end">
-                  <div className="flex-1">
-                    <label className="text-[10px] font-semibold text-gray-600 block">Scenario Preset</label>
-                    <select value={scenarioId} onChange={e => setScenarioId(e.target.value)}
-                      className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-[#1565a7]">
-                      {SCENARIOS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-[10px] font-semibold text-gray-600 block">Gender</label>
-                    <div className="flex gap-1">
-                      {(["male","female"] as Gender[]).map(g => (
-                        <button key={g} onClick={() => setGender(g)}
-                          className={`px-2 py-1 text-[10px] rounded border-2 capitalize ${gender === g ? "border-[#1565a7] bg-blue-50 text-[#1565a7] font-semibold" : "border-gray-200 text-gray-600"}`}>
-                          {g}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                <div>
+                  <label className="text-[10px] font-semibold text-gray-600 block">Scenario Preset</label>
+                  <select value={scenarioId} onChange={e => setScenarioId(e.target.value)}
+                    className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-[#1565a7]">
+                    {SCENARIOS.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+                  </select>
                 </div>
                 <div>
                   <label className="text-[10px] font-semibold text-gray-600 block">Voice (Kokoro)</label>
                   <select value={voiceId} onChange={e => setVoiceId(e.target.value)}
                     className="w-full px-2 py-1 text-xs border border-gray-300 rounded focus:outline-none focus:ring-1 focus:ring-[#1565a7]">
-                    <option value="">Auto (random for gender)</option>
+                    <option value="">Auto (random)</option>
                     {KOKORO_VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
                   </select>
+                  <p className="text-[9px] text-gray-400 mt-0.5">Voice determines the prospect's gender.</p>
                 </div>
                 {scenarioId === "custom" && (
                   <textarea value={customPrompt} onChange={e => setCustomPrompt(e.target.value)}
@@ -219,8 +216,11 @@ function IntroPopup({ onStart }: { onStart: (r: IntroResult) => void }) {
           </div>
 
           {error && <p className="text-red-600 text-xs font-medium">{error}</p>}
-          <button onClick={handleStart} className="w-full bg-[#1565a7] hover:bg-[#1255a0] text-white font-semibold py-2 rounded transition-colors flex items-center justify-center gap-2 text-sm"><Phone className="w-4 h-4" /> Start Voice Call</button>
-          <p className="text-[10px] text-gray-400 text-center">Powered by Kokoro TTS — downloading lifelike voice model in the background (~100 MB, cached after first load).</p>
+          <button onClick={handleStart} disabled={!voiceLoaded}
+            className="w-full bg-[#1565a7] hover:bg-[#1255a0] disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-2 rounded transition-colors flex items-center justify-center gap-2 text-sm">
+            {voiceLoaded ? <><Phone className="w-4 h-4" /> Start Voice Call</> : <><Loader2 className="w-4 h-4 animate-spin" /> Loading voice model...</>}
+          </button>
+          <p className="text-[10px] text-gray-400 text-center">{voiceLoaded ? "Voice model ready (Kokoro TTS — runs entirely in your browser)." : "Powered by Kokoro TTS — first load downloads ~100 MB, then it's cached."}</p>
         </div>
       </div>
     </div>

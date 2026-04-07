@@ -9,6 +9,30 @@ let ttsPromise: Promise<TTSInstance> | null = null;
 let currentAudio: HTMLAudioElement | null = null;
 let currentUrl: string | null = null;
 
+// Shared AudioContext for gapless Web Audio playback (works correctly in
+// Firefox where chained HTMLAudioElement playback crackles).
+let audioCtx: AudioContext | null = null;
+let scheduledSources: AudioBufferSourceNode[] = [];
+let nextStartTime = 0;
+
+function getAudioContext(): AudioContext {
+  if (!audioCtx || audioCtx.state === "closed") {
+    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
+}
+
+function stopWebAudio() {
+  for (const src of scheduledSources) {
+    try { src.onended = null; src.stop(); src.disconnect(); } catch {}
+  }
+  scheduledSources = [];
+  nextStartTime = 0;
+}
+
 // Map app gender → Kokoro voice IDs (American English, highest quality set)
 const VOICE_BY_GENDER: Record<Gender, string> = {
   female: "af_heart",
@@ -68,12 +92,18 @@ async function getTTS(): Promise<TTSInstance> {
 }
 
 /** Kick off the model download ahead of time (e.g. when the user opens the intro). */
-export function preloadKokoro(): void {
-  getTTS().catch((e) => console.warn("[Kokoro] preload failed", e));
+export function preloadKokoro(): Promise<void> {
+  return getTTS().then(() => {}).catch((e) => { console.warn("[Kokoro] preload failed", e); throw e; });
 }
 
-export function isKokoroLoaded(): boolean {
-  return ttsPromise !== null;
+let _ready = false;
+getTTS().then(() => { _ready = true; }).catch(() => {});
+
+export function isKokoroReady(): boolean { return _ready; }
+
+/** Resolves when the Kokoro model is fully loaded and ready to synthesize. */
+export function kokoroReady(): Promise<void> {
+  return getTTS().then(() => { _ready = true; });
 }
 
 export function stopKokoro(): void {
@@ -85,6 +115,7 @@ export function stopKokoro(): void {
     currentUrl = null;
   }
   currentAudio = null;
+  stopWebAudio();
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -112,15 +143,16 @@ export async function speakWithKokoro(
     const voice = resolveVoice(opts);
     const result: any = await withTimeout(tts.generate(text, { voice }), 30_000, "Kokoro generate");
     const blob: Blob = typeof result.toBlob === "function" ? result.toBlob() : result;
-    const url = URL.createObjectURL(blob);
-    currentUrl = url;
-    const el = new Audio(url);
-    el.volume = 1; el.muted = false;
-    currentAudio = el;
-    el.onplay = () => onStart?.();
-    el.onended = () => { stopKokoro(); onEnd?.(); };
-    el.onerror = () => { stopKokoro(); onEnd?.(); };
-    await el.play();
+    const ctx = getAudioContext();
+    const arrayBuf = await blob.arrayBuffer();
+    const buffer = await ctx.decodeAudioData(arrayBuf.slice(0));
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    scheduledSources.push(src);
+    onStart?.();
+    src.onended = () => { stopKokoro(); onEnd?.(); };
+    src.start();
   } catch (err) {
     console.error("[Kokoro] speak failed", err);
     stopKokoro();
@@ -185,8 +217,14 @@ export async function streamSpeakWithKokoro(
       }
     })();
 
-    // Consumer: play queued blobs in order
+    // Consumer: decode each blob via Web Audio and schedule it back-to-back
+    // for gapless playback. This replaces chained HTMLAudioElement playback
+    // (which crackles in Firefox between chunks).
+    const ctx = getAudioContext();
+    nextStartTime = 0;
     let playedFirst = false;
+    let lastEndPromise: Promise<void> = Promise.resolve();
+
     while (!isAborted()) {
       if (audioQueue.length === 0) {
         if (producerDone) break;
@@ -194,22 +232,37 @@ export async function streamSpeakWithKokoro(
         continue;
       }
       const blob = audioQueue.shift()!;
-      const url = URL.createObjectURL(blob);
-      currentUrl = url;
-      const el = new Audio(url);
-      el.volume = 1; el.muted = false;
-      currentAudio = el;
+      let buffer: AudioBuffer;
+      try {
+        const arrayBuf = await blob.arrayBuffer();
+        buffer = await ctx.decodeAudioData(arrayBuf.slice(0));
+      } catch (e) {
+        console.warn("[Kokoro] decode failed", e);
+        continue;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+
+      const startAt = Math.max(ctx.currentTime + 0.02, nextStartTime);
+      try { src.start(startAt); } catch { continue; }
+      nextStartTime = startAt + buffer.duration;
+      scheduledSources.push(src);
+
       if (!playedFirst) {
         playedFirst = true;
-        callbacks?.onFirstAudio?.();
+        // Fire onFirstAudio at the actual playback start time
+        const delayMs = Math.max(0, (startAt - ctx.currentTime) * 1000);
+        setTimeout(() => callbacks?.onFirstAudio?.(), delayMs);
       }
-      await new Promise<void>((res) => {
-        el.onended = () => { try { URL.revokeObjectURL(url); } catch {}; res(); };
-        el.onerror = () => { try { URL.revokeObjectURL(url); } catch {}; res(); };
-        el.play().catch(() => res());
+
+      lastEndPromise = new Promise<void>((res) => {
+        src.onended = () => res();
       });
-      if (isAborted()) break;
     }
+
+    // Wait for the last scheduled chunk to finish playing
+    await lastEndPromise;
 
     await producer.catch(() => {});
     await collector.catch(() => {});
