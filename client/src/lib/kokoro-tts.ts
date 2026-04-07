@@ -23,15 +23,14 @@ const IS_FIREFOX = typeof navigator !== "undefined" && /firefox/i.test(navigator
 function getAudioContext(): AudioContext {
   if (!audioCtx || audioCtx.state === "closed") {
     const Ctor = window.AudioContext || (window as any).webkitAudioContext;
-    try {
-      audioCtx = new Ctor({ sampleRate: KOKORO_SAMPLE_RATE });
-    } catch {
-      // Some platforms reject non-standard sample rates — fall back to default.
-      audioCtx = new Ctor();
-    }
+    // Use the browser's native rate. AudioBuffers at a different rate are
+    // auto-resampled per spec. Forcing a non-standard rate breaks Firefox
+    // on devices where the output stream can't be opened at that rate.
+    audioCtx = new Ctor();
+    console.log("[Kokoro] AudioContext created", { state: audioCtx.state, sampleRate: audioCtx.sampleRate });
   }
   if (audioCtx.state === "suspended") {
-    audioCtx.resume().catch(() => {});
+    audioCtx.resume().then(() => console.log("[Kokoro] AudioContext resumed", audioCtx?.state)).catch((e) => console.warn("[Kokoro] resume failed", e));
   }
   return audioCtx;
 }
@@ -40,20 +39,43 @@ function getAudioContext(): AudioContext {
  * MUST be called from inside a user-gesture handler (e.g. button click).
  * Firefox keeps the AudioContext suspended until a user gesture explicitly
  * resumes it; without this, no Web Audio output ever plays. Also primes
- * the context with a silent buffer to fully unlock playback.
+ * the context with a silent buffer and installs a global listener so any
+ * subsequent user interaction will re-resume it (Firefox auto-suspends
+ * the context after periods of inactivity).
  */
 export function unlockAudio(): void {
   try {
     const ctx = getAudioContext();
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
-    // Play a 1-sample silent buffer to mark the context as user-activated
     const buffer = ctx.createBuffer(1, 1, 22050);
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
     src.start(0);
+    installResumeListeners();
   } catch (e) {
     console.warn("[Kokoro] unlockAudio failed", e);
+  }
+}
+
+let resumeListenersInstalled = false;
+function installResumeListeners() {
+  if (resumeListenersInstalled || typeof document === "undefined") return;
+  resumeListenersInstalled = true;
+  const handler = () => {
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+  };
+  ["click", "keydown", "touchstart", "pointerdown"].forEach(e =>
+    document.addEventListener(e, handler, { capture: true, passive: true } as any)
+  );
+}
+
+/** Best-effort: nudge the context awake right before scheduling playback. */
+async function ensureContextRunning(ctx: AudioContext): Promise<void> {
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch {}
   }
 }
 
@@ -257,6 +279,7 @@ export async function streamSpeakWithKokoro(
     })();
 
     const ctx = getAudioContext();
+    await ensureContextRunning(ctx);
     nextStartTime = 0;
 
     if (IS_FIREFOX) {
@@ -285,6 +308,7 @@ export async function streamSpeakWithKokoro(
         for (const c of collected) { merged.set(c, offset); offset += c.length; }
         const buffer = ctx.createBuffer(1, merged.length, sr);
         buffer.getChannelData(0).set(merged);
+        await ensureContextRunning(ctx);
         const src = ctx.createBufferSource();
         src.buffer = buffer;
         src.connect(ctx.destination);
