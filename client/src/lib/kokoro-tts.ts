@@ -18,7 +18,16 @@ const VOICE_BY_GENDER: Record<Gender, string> = {
 async function getTTS(): Promise<TTSInstance> {
   if (!ttsPromise) {
     ttsPromise = (async () => {
-      const { KokoroTTS } = await import("kokoro-js");
+      const { KokoroTTS, env } = await import("kokoro-js");
+      // Pin the ONNX runtime WASM assets to the jsDelivr CDN so loading
+      // works regardless of base path (GitHub Pages subpath, etc.).
+      try {
+        const onnxEnv: any = (env as any)?.backends?.onnx;
+        if (onnxEnv?.wasm) {
+          onnxEnv.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+          onnxEnv.wasm.numThreads = 1;
+        }
+      } catch {}
       // Try WebGPU first (much faster), fall back to WASM.
       const hasWebGPU = typeof navigator !== "undefined" && (navigator as any).gpu;
       return KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
@@ -51,6 +60,13 @@ export function stopKokoro(): void {
   currentAudio = null;
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    p.then(v => { clearTimeout(to); resolve(v); }).catch(e => { clearTimeout(to); reject(e); });
+  });
+}
+
 export async function speakWithKokoro(
   text: string,
   gender: Gender,
@@ -59,13 +75,17 @@ export async function speakWithKokoro(
 ): Promise<void> {
   stopKokoro();
   try {
-    const tts = await getTTS();
+    // Cap the first-load wait at 60s so we don't hang forever if the model
+    // download stalls. Subsequent calls hit cached weights and are fast.
+    const tts = await withTimeout(getTTS(), 60_000, "Kokoro model load");
     const voice = VOICE_BY_GENDER[gender] || "am_michael";
-    const result: any = await tts.generate(text, { voice });
+    const result: any = await withTimeout(tts.generate(text, { voice }), 30_000, "Kokoro generate");
     const blob: Blob = typeof result.toBlob === "function" ? result.toBlob() : result;
     const url = URL.createObjectURL(blob);
     currentUrl = url;
     const el = new Audio(url);
+    el.volume = 1;
+    el.muted = false;
     currentAudio = el;
     el.onplay = () => onStart?.();
     el.onended = () => { stopKokoro(); onEnd?.(); };
