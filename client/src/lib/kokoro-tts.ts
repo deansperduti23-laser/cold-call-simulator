@@ -16,9 +16,9 @@ let scheduledSources: AudioBufferSourceNode[] = [];
 let nextStartTime = 0;
 
 // Kokoro outputs at 24 kHz. Forcing the AudioContext to the same rate
-// avoids the browser's automatic resampling step (Firefox in particular
-// produced loud crackling when resampling 24 kHz → 48 kHz live).
+// avoids the browser's automatic resampling step.
 const KOKORO_SAMPLE_RATE = 24000;
+const IS_FIREFOX = typeof navigator !== "undefined" && /firefox/i.test(navigator.userAgent);
 
 function getAudioContext(): AudioContext {
   if (!audioCtx || audioCtx.state === "closed") {
@@ -256,49 +256,76 @@ export async function streamSpeakWithKokoro(
       }
     })();
 
-    // Consumer: decode each blob via Web Audio and schedule it back-to-back
-    // for gapless playback. This replaces chained HTMLAudioElement playback
-    // (which crackles in Firefox between chunks).
     const ctx = getAudioContext();
     nextStartTime = 0;
-    let playedFirst = false;
-    let lastEndPromise: Promise<void> = Promise.resolve();
 
-    while (!isAborted()) {
-      if (audioQueue.length === 0) {
-        if (producerDone) break;
-        await new Promise<void>(r => { queueWaiter.fn = r; });
-        continue;
+    if (IS_FIREFOX) {
+      // Firefox glitches at AudioBufferSourceNode boundaries when chained
+      // sources are scheduled back-to-back. Buffer everything, concatenate
+      // into one continuous Float32Array, and play as a single source.
+      const collected: Float32Array[] = [];
+      let sr = KOKORO_SAMPLE_RATE;
+      while (!isAborted()) {
+        if (audioQueue.length === 0) {
+          if (producerDone) break;
+          await new Promise<void>(r => { queueWaiter.fn = r; });
+          continue;
+        }
+        const chunk = audioQueue.shift()!;
+        sr = chunk.sampleRate;
+        const owned = new Float32Array(chunk.samples.length);
+        owned.set(chunk.samples);
+        collected.push(owned);
       }
-      const chunk = audioQueue.shift()!;
-      // Detach from any shared underlying ArrayBuffer the model may reuse
-      const owned = new Float32Array(chunk.samples.length);
-      owned.set(chunk.samples);
-      const buffer = ctx.createBuffer(1, owned.length, chunk.sampleRate);
-      buffer.getChannelData(0).set(owned);
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(ctx.destination);
-
-      const startAt = Math.max(ctx.currentTime + 0.02, nextStartTime);
-      try { src.start(startAt); } catch { continue; }
-      nextStartTime = startAt + buffer.duration;
-      scheduledSources.push(src);
-
-      if (!playedFirst) {
-        playedFirst = true;
-        // Fire onFirstAudio at the actual playback start time
-        const delayMs = Math.max(0, (startAt - ctx.currentTime) * 1000);
-        setTimeout(() => callbacks?.onFirstAudio?.(), delayMs);
+      const totalLen = collected.reduce((s, a) => s + a.length, 0);
+      if (totalLen === 0) { /* nothing to play */ }
+      else {
+        const merged = new Float32Array(totalLen);
+        let offset = 0;
+        for (const c of collected) { merged.set(c, offset); offset += c.length; }
+        const buffer = ctx.createBuffer(1, merged.length, sr);
+        buffer.getChannelData(0).set(merged);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        scheduledSources.push(src);
+        callbacks?.onFirstAudio?.();
+        await new Promise<void>((res) => {
+          src.onended = () => res();
+          try { src.start(); } catch { res(); }
+        });
       }
-
-      lastEndPromise = new Promise<void>((res) => {
-        src.onended = () => res();
-      });
+    } else {
+      // Chromium path: stream chunks, schedule back-to-back for low latency.
+      let playedFirst = false;
+      let lastEndPromise: Promise<void> = Promise.resolve();
+      while (!isAborted()) {
+        if (audioQueue.length === 0) {
+          if (producerDone) break;
+          await new Promise<void>(r => { queueWaiter.fn = r; });
+          continue;
+        }
+        const chunk = audioQueue.shift()!;
+        const owned = new Float32Array(chunk.samples.length);
+        owned.set(chunk.samples);
+        const buffer = ctx.createBuffer(1, owned.length, chunk.sampleRate);
+        buffer.getChannelData(0).set(owned);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        const startAt = Math.max(ctx.currentTime + 0.02, nextStartTime);
+        try { src.start(startAt); } catch { continue; }
+        nextStartTime = startAt + buffer.duration;
+        scheduledSources.push(src);
+        if (!playedFirst) {
+          playedFirst = true;
+          const delayMs = Math.max(0, (startAt - ctx.currentTime) * 1000);
+          setTimeout(() => callbacks?.onFirstAudio?.(), delayMs);
+        }
+        lastEndPromise = new Promise<void>((res) => { src.onended = () => res(); });
+      }
+      await lastEndPromise;
     }
-
-    // Wait for the last scheduled chunk to finish playing
-    await lastEndPromise;
 
     await producer.catch(() => {});
     await collector.catch(() => {});
