@@ -31,6 +31,23 @@ function gradeExchange(repText: string, prospectText: string): { grade: Exchange
 
 const GRADE_COLORS: Record<string, string> = { A: "bg-green-600 text-white", B: "bg-blue-600 text-white", C: "bg-yellow-500 text-black", D: "bg-orange-500 text-white", F: "bg-red-600 text-white" };
 const RESULT_BUTTONS = ["NO", "NC", "NA-HOT", "LM", "CCC", "EMAIL", "WW", "DNC"];
+
+// Heuristic suggester: given the conversation, what disposition the rep
+// SHOULD have logged. Used to grade whether they hit the right button.
+function suggestResult(transcript: Message[]): string {
+  if (!transcript || transcript.length === 0) return "NC";
+  const prospect = transcript.filter(m => m.role === "prospect").map(m => m.content).join(" ").toLowerCase();
+  if (!prospect) return "NC";
+  if (/(do not call|don't call|never call|take me off|remove me)/.test(prospect)) return "DNC";
+  if (/(voicemail|leave (a |your )?message|please leave|after the (beep|tone))/.test(prospect)) return "LM";
+  if (/(send (me )?(an )?e-?mail|email (me|it)|shoot me an e-?mail)/.test(prospect)) return "EMAIL";
+  if (/(call (me )?back|try (me )?later|catch me later|busy right now|bad time|in a meeting)/.test(prospect)) return "CCC";
+  if (/(interested|tell me more|sounds good|let'?s (talk|chat|schedule|set up|book)|book|schedule|next week|tuesday|thursday|monday|friday|put.*calendar|set up.*meeting)/.test(prospect)) return "NA-HOT";
+  if (/(wrong (number|person|department|window)|you have the wrong)/.test(prospect)) return "WW";
+  if (/(not interested|no thanks|not a fit|pass|we're good|all set|already have)/.test(prospect)) return "NO";
+  if (transcript.length < 4) return "NC";
+  return "NO";
+}
 const RESULT_COLORS: Record<string, string> = { "NO": "bg-red-600 hover:bg-red-700", "NC": "bg-gray-500 hover:bg-gray-600", "NA-HOT": "bg-orange-500 hover:bg-orange-600", "LM": "bg-blue-600 hover:bg-blue-700", "CCC": "bg-purple-600 hover:bg-purple-700", "EMAIL": "bg-teal-600 hover:bg-teal-700", "WW": "bg-yellow-600 hover:bg-yellow-700", "DNC": "bg-gray-800 hover:bg-gray-900" };
 
 // ── Intro Popup ──────────────────────────────────────────────────────────────
@@ -399,6 +416,10 @@ export default function Call() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [input, setInput] = useState("");
   const callConfigRef = useRef<CallConfig | null>(null);
+  const introOptsRef = useRef<{ jobTitleId: string; scenarioId: string; customPrompt: string } | null>(
+    (() => { try { const raw = localStorage.getItem("intro_opts"); return raw ? JSON.parse(raw) : null; } catch { return null; } })()
+  );
+  const [resultFeedback, setResultFeedback] = useState<{ picked: string; suggested: string; correct: boolean } | null>(null);
 
   // Load session
   useEffect(() => {
@@ -474,17 +495,49 @@ export default function Call() {
 
   const handleIntroStart = (r: IntroResult) => {
     setApiKey(r.apiKey);
-    const config = generateCallConfig({
-      jobTitleId: r.jobTitleId,
-      scenarioId: r.scenarioId,
-      customPrompt: r.customPrompt,
-      gender: r.gender,
-    });
+    const opts = { jobTitleId: r.jobTitleId, scenarioId: r.scenarioId, customPrompt: r.customPrompt };
+    introOptsRef.current = opts;
+    localStorage.setItem("intro_opts", JSON.stringify(opts));
+    const config = generateCallConfig({ ...opts, gender: r.gender });
     callConfigRef.current = config;
     const s = createSession({ productId: DEFAULT_PRODUCT_ID, callConfig: config, script: r.script ?? undefined });
     setSession(s); setSessionId(s.id);
     setShowIntro(false);
     window.location.hash = `/call/${s.id}`;
+  };
+
+  // "Stack" mode — log a disposition and immediately roll into the next call
+  // with a fresh random rep, keeping the same job/scenario the user picked.
+  const advanceToNextCall = useCallback(() => {
+    if (!introOptsRef.current) return;
+    if (timerRef.current) clearInterval(timerRef.current);
+    window.speechSynthesis?.cancel();
+    setMicEnabled(false);
+    setTranscript([]); setGrades([]); setCallDuration(0);
+    setSelectedResult(""); setNotes(""); setInput("");
+    const newGender = (Math.random() < 0.5 ? "male" : "female") as Gender;
+    const config = generateCallConfig({ ...introOptsRef.current, gender: newGender });
+    callConfigRef.current = config;
+    const previousScript = session?.script;
+    const s = createSession({ productId: DEFAULT_PRODUCT_ID, callConfig: config, script: previousScript });
+    setSession(s); setSessionId(s.id);
+    window.location.hash = `/call/${s.id}`;
+    setTimeout(() => setMicEnabled(true), 400);
+  }, [session]);
+
+  const handlePickResult = (result: string) => {
+    if (!sessionId) return;
+    const suggested = suggestResult(transcript);
+    const correct = result === suggested;
+    setSelectedResult(result);
+    setResultFeedback({ picked: result, suggested, correct });
+    updateSession(sessionId, {
+      status: "completed",
+      endedAt: new Date().toISOString(),
+      transcript,
+      scorecardJson: { quickResult: result, suggestedResult: suggested, resultCorrect: correct },
+    });
+    setTimeout(() => { setResultFeedback(null); advanceToNextCall(); }, 1500);
   };
 
   const handleEndCall = async () => {
@@ -537,7 +590,6 @@ export default function Call() {
     <div className="min-h-screen flex flex-col bg-[#e8ecf0] font-sans text-xs">
       <div className="bg-[#2980c9] px-3 py-1 flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-3"><span className="text-white font-semibold text-xs">Emerge Sales Leads</span></div>
-        <div className="flex items-center gap-2"><select className="text-xs px-2 py-0.5 rounded border-0 bg-white text-gray-700"><option>Search All</option></select><input className="text-xs px-2 py-0.5 rounded border-0 w-40" placeholder="Search..." /><button className="bg-[#1565a7] text-white text-xs px-2 py-0.5 rounded">Go</button></div>
       </div>
 
       {endCallError && <div className="bg-amber-100 border-b border-amber-300 px-3 py-1.5 flex items-center gap-2"><AlertTriangle className="w-3.5 h-3.5 text-amber-600" /><span className="text-xs text-amber-800">{endCallError}</span><button onClick={handleEndCall} className="ml-auto text-xs bg-amber-200 hover:bg-amber-300 px-2 py-0.5 rounded">Retry</button></div>}
@@ -546,7 +598,6 @@ export default function Call() {
       <div className="flex flex-1 overflow-hidden">
         {/* LEFT */}
         <div className="w-56 bg-white border-r border-gray-300 flex flex-col flex-shrink-0 overflow-y-auto">
-          <div className="border-b border-gray-200 px-3 py-1.5 flex items-center gap-3 bg-gray-50"><button className="text-blue-700 font-medium hover:underline">Edit</button><button className="text-blue-700 font-medium hover:underline">Add</button></div>
           <div className="px-3 py-3 border-b border-gray-200">
             <div className="font-bold text-sm text-gray-900">{config.displayName}</div><div className="text-gray-600 mt-0.5">{config.jobFullTitle}</div>
             <div className="mt-2"><div className="font-semibold text-gray-800">{config.company}</div><div className="text-gray-600 mt-0.5">Medical Device</div></div>
@@ -576,7 +627,7 @@ export default function Call() {
           <div className="flex-1 flex flex-col overflow-hidden">
           {activeTab === "Demographics" && <div className="flex-1 overflow-y-auto p-4"><table className="w-full text-xs border-collapse"><tbody>{[["Company",config.company],["Title",config.jobFullTitle],["Industry","Medical Device / MedTech"],["Phone",phoneNumber],["Scenario",config.scenarioLabel]].map(([l,v]) => <tr key={l} className="border-b border-gray-100"><td className="py-2 px-3 text-gray-500 font-medium w-36 bg-gray-50">{l}</td><td className="py-2 px-3 text-gray-800">{v}</td></tr>)}</tbody></table></div>}
           {activeTab === "Script" && (
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div className="flex-1 overflow-y-auto p-4">
               {session.script ? (
                 <div>
                   <div className="flex items-center justify-between mb-2">
@@ -585,13 +636,10 @@ export default function Call() {
                   <ScriptViewer script={session.script} />
                 </div>
               ) : (
-                <div>
-                  <div className="flex items-center gap-2 mb-2"><FileText className="w-4 h-4 text-gray-400" /><span className="text-xs font-semibold text-gray-700 uppercase tracking-wide">Default Script</span></div>
-                  <div className="bg-gray-50 border border-gray-200 rounded p-3 text-xs text-gray-700 leading-relaxed space-y-3">
-                    <p><strong>Opening:</strong> "Hi {config.displayName.split(" ")[0]}, this is [your name] calling from Emerge. We work exclusively with medical device companies. Do you have 60 seconds?"</p>
-                    <p><strong>Value:</strong> "We help companies like {config.company} get a qualified pipeline in 30-60 days."</p>
-                    <p><strong>Discovery:</strong> "What does your pipeline coverage look like?"</p>
-                  </div>
+                <div className="flex flex-col items-center justify-center h-full text-center text-gray-400">
+                  <FileText className="w-8 h-8 mb-2" />
+                  <p className="text-xs">No script file embedded.</p>
+                  <p className="text-[10px] mt-1">Upload a .pdf, .docx, or .txt at the start of your call to view it here.</p>
                 </div>
               )}
             </div>
@@ -610,7 +658,7 @@ export default function Call() {
             </div>
 
             <div className="flex-1 overflow-y-auto space-y-3 pr-1" style={{ maxHeight: "calc(100vh - 340px)" }}>
-              {transcript.length === 0 && <div className="text-center py-10"><p className="text-sm font-medium text-gray-600">{config.displayName} is on the line</p><p className="text-xs text-gray-400 mt-1">Start speaking — your mic is live.</p></div>}
+              {transcript.length === 0 && <div className="text-center py-10"><p className="text-sm font-medium text-gray-600">Call is connected</p><p className="text-xs text-gray-400 mt-1">Start speaking — your mic is live.</p></div>}
               {transcript.map((msg, idx) => (
                 <div key={idx} className={`flex gap-2 ${msg.role === "rep" ? "flex-row-reverse" : "flex-row"}`}>
                   <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-semibold ${msg.role === "rep" ? "bg-[#1565a7] text-white" : "bg-gray-200 text-gray-600"}`}>{msg.role === "rep" ? "R" : config.displayName[0]}</div>
@@ -642,7 +690,17 @@ export default function Call() {
               {isEnding ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Scoring...</> : <><PhoneOff className="w-3.5 h-3.5" /> End Call & Score</>}
             </button>
           </div>
-          <div className="p-2 border-b border-gray-200"><div className="text-gray-500 text-[10px] uppercase tracking-wide mb-1.5">Call Result</div><div className="space-y-1">{RESULT_BUTTONS.map(r => <button key={r} onClick={() => setSelectedResult(r)} className={`w-full text-left px-3 py-1.5 rounded text-xs font-bold text-white ${selectedResult === r ? RESULT_COLORS[r] + " ring-2 ring-offset-1 ring-gray-400" : RESULT_COLORS[r]}`}>{r}</button>)}</div></div>
+          <div className="p-2 border-b border-gray-200">
+            <div className="text-gray-500 text-[10px] uppercase tracking-wide mb-1.5">Call Result</div>
+            <div className="space-y-1">{RESULT_BUTTONS.map(r => <button key={r} onClick={() => handlePickResult(r)} disabled={!!resultFeedback} className={`w-full text-left px-3 py-1.5 rounded text-xs font-bold text-white disabled:opacity-60 ${selectedResult === r ? RESULT_COLORS[r] + " ring-2 ring-offset-1 ring-gray-400" : RESULT_COLORS[r]}`}>{r}</button>)}</div>
+            {resultFeedback && (
+              <div className={`mt-2 text-[10px] rounded px-2 py-1.5 ${resultFeedback.correct ? "bg-green-100 text-green-800 border border-green-300" : "bg-amber-100 text-amber-800 border border-amber-300"}`}>
+                {resultFeedback.correct
+                  ? `Correct disposition (${resultFeedback.picked}). Loading next call...`
+                  : `Picked ${resultFeedback.picked}. Suggested: ${resultFeedback.suggested}. Loading next call...`}
+              </div>
+            )}
+          </div>
           <div className="flex-1 overflow-y-auto p-2"><div className="text-gray-500 text-[10px] uppercase tracking-wide mb-2">Exchange Grades</div>
             {grades.length === 0 ? <p className="text-[10px] text-gray-400 italic">Grades appear after each exchange.</p> :
             <div className="space-y-1.5">{grades.map((g,i) => <div key={i} className="flex items-center gap-2"><span className={`w-6 h-6 rounded font-bold text-xs flex items-center justify-center ${GRADE_COLORS[g.grade]}`}>{g.grade}</span><div className="flex-1 min-w-0"><p className="text-[10px] text-gray-500">Exchange {g.exchange}</p><p className="text-[10px] text-gray-700 truncate">{g.note}</p></div></div>)}</div>}
